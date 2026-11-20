@@ -1,0 +1,32 @@
+[package]
+authors = ["Torin Linsley"]
+license = "LGPL-2.1"
+name = "night_viewing"
+version = "0.0.1"
+edition = "2024"
+description = "Night Viewing - a pure black screen dimming overlay with a modern GUI and tray support"
+
+[dependencies]
+tray-icon = "0.26"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+windows = { version = "0.62", features = [
+    "Win32_Foundation",
+    "Win32_Graphics_Dwm",
+    "Win32_Graphics_Gdi",
+    "Win32_System_LibraryLoader",
+    "Win32_Security",
+    "Win32_System_Registry",
+    "Win32_System_Threading",
+    "Win32_UI_HiDpi", "Win32_Devices_Display",
+    "Win32_UI_Shell",
+    "Win32_UI_Input_KeyboardAndMouse",
+    "Win32_UI_WindowsAndMessaging",
+] }
+
+[profile.release]
+opt-level = "s"
+codegen-units = 1
+lto = true
+panic = "abort"
+strip = true
