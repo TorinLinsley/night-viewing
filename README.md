@@ -10,7 +10,7 @@
 2. 放到任意目录双击`NightViewing.exe`运行（无需安装、无需管理员权限）
 3. 首次启动只在托盘出现一个软件图标 —— 双击托盘图标或者右键托盘图标方式打开界面
 
-> 首次运行会在 exe 同目录生成 `config.json`（在软件界面有一次改动后）；若该目录不可写（例如放在 Program Files），会改用 `%APPDATA%\NightViewing\config.json`。
+> 首次运行会在 exe 同目录生成 `config.json`；若该目录不可写（例如放在 Program Files），会改用 `%APPDATA%\NightViewing\config.json`。
 
 ## 功能
 
