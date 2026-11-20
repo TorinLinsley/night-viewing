@@ -81,8 +81,9 @@
 git clone https://github.com/TorinLinsley/night-viewing.git
 cd night-viewing
 cargo build --release
-# 产物：target/release/night_viewing.exe
 ```
+
+>产物：`target/release/night_viewing.exe`
 
 图标与版本信息资源通过 `build.rs` 调用 `rc.exe` 编译 `assets/app.rc`；若环境里找不到资源编译器，会跳过该步（程序仍可编译运行，只是 exe 没有图标与版本信息）。可以用环境变量 `RC` 指定 `rc.exe` 的绝对路径。
 
