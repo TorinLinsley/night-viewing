@@ -377,6 +377,7 @@ pub struct Gui {
     max_scroll: i32,
     tray: Option<TrayIcon>,
     tray_dark: Option<bool>,
+    tray_auto: bool,
     monitors: Vec<winapi_util::Monitor>,
     slider_rect: RECT,
     auto_h: bool,
@@ -398,6 +399,7 @@ impl Gui {
     fn new(core: Arc<Core>, for_dark: bool, tray: Option<TrayIcon>, s: f32) -> Self {
         let (cfg, rev) = core.snapshot();
         let lang = cfg.lang;
+        let auto_init = cfg.autostart;
         Gui {
             core,
             num: format!("{}", cfg.opacity.round() as i32),
@@ -430,6 +432,7 @@ impl Gui {
             max_scroll: 0,
             tray,
             tray_dark: Some(for_dark),
+            tray_auto: auto_init,
             monitors: winapi_util::monitors(),
             slider_rect: RECT::default(),
             auto_h: true,
@@ -498,6 +501,7 @@ impl Gui {
             self.tray_dark = Some(dark);
             crate::osd::set_dark(dark);
         }
+        self.sync_tray_menu();
         if !self.hwnd.0.is_null() {
             let v: i32 = if dark { 1 } else { 0 };
             unsafe {
@@ -601,6 +605,18 @@ impl Gui {
         self.num_up = fmt_step(self.cfg.step_up);
         self.num_dn = fmt_step(self.cfg.step_down);
         self.repaint();
+    }
+
+    fn sync_tray_menu(&mut self) {
+        if self.tray_auto == self.cfg.autostart {
+            return;
+        }
+        self.tray_auto = self.cfg.autostart;
+        if crate::tray::take_tray_origin() {
+            return;
+        }
+        self.tray = None;
+        self.tray = crate::tray::init(&self.core, self.dark, self.cfg.lang);
     }
 
     fn set_level(&mut self, v: f32) {

@@ -12,6 +12,12 @@ use crate::icon;
 use crate::osd;
 
 static CLICK_GEN: AtomicU64 = AtomicU64::new(0);
+static TRAY_ORIGIN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+pub fn take_tray_origin() -> bool {
+    TRAY_ORIGIN.swap(false, Ordering::SeqCst)
+}
+
 
 pub fn init(core: &Arc<Core>, for_dark: bool, lang: Lang) -> Option<TrayIcon> {
     let menu = Menu::new();
@@ -86,7 +92,10 @@ pub fn init(core: &Arc<Core>, for_dark: bool, lang: Lang) -> Option<TrayIcon> {
             "inc" => core_for_menu.nudge_step(1.0),
             "dec" => core_for_menu.nudge_step(-1.0),
             "reset" => core_for_menu.set_level(None, 0.0),
-            "autostart" => core_for_menu.toggle_autostart(),
+            "autostart" => {
+                TRAY_ORIGIN.store(true, Ordering::SeqCst);
+                core_for_menu.toggle_autostart();
+            }
             "quit" => core_for_menu.quit(),
             _ => {}
         }
