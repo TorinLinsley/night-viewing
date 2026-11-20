@@ -59,6 +59,7 @@ static HK_KEYS: [AtomicU64; 4] = [
 static HK_SIG: AtomicU64 = AtomicU64::new(u64::MAX);
 static MON_REG: Mutex<Vec<(i32, String, u8, f32, u32, u32)>> = Mutex::new(Vec::new());
 static REG_IDS: Mutex<Vec<i32>> = Mutex::new(Vec::new());
+static LAST_STRUCT: Mutex<String> = Mutex::new(String::new());
 
 pub fn apply(cfg: &Config) {
     let pct = cfg.opacity.clamp(0.0, MAX_LEVEL);
@@ -75,16 +76,47 @@ pub fn apply(cfg: &Config) {
             .unwrap_or(0);
         HK_KEYS[i].store(packed, Ordering::Relaxed);
     }
-    if let Ok(mut reg) = MON_REG.lock() {
-        reg.clear();
-        for (i, m) in winapi_util::monitors().iter().enumerate().take(8) {
-            if let Some(list) = cfg.mon_hk.get(&m.device) {
-                for (k, e) in list.iter().enumerate().take(8) {
-                    if let Some((mods, vk)) = crate::hotkey::parse(&e.spec) {
-                        reg.push((100 + (i as i32) * 10 + k as i32, m.device.clone(), e.act, e.step, mods, vk));
+    let mut mon_sig = String::new();
+    for (dev, list) in cfg.mon_hk.iter() {
+        mon_sig.push_str(dev);
+        mon_sig.push('|');
+        for e in list {
+            mon_sig.push_str(&format!("{},{},{},{};", e.act, e.step, e.spec, crate::hotkey::parse(&e.spec).map(|(m, v)| (m, v)).unwrap_or((0, 0)).0));
+        }
+    }
+    let structural = format!(
+        "{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}",
+        cfg.hotkeys,
+        cfg.passthrough,
+        cfg.always_on_top,
+        cfg.hk_inc,
+        cfg.hk_dec,
+        cfg.hk_off,
+        cfg.hk_toggle,
+        mon_sig,
+        cfg.explicit_displays,
+        cfg.displays.join(";"),
+        winapi_util::monitor_generation()
+    );
+    let changed = LAST_STRUCT
+        .lock()
+        .map(|s| s.as_str() != structural)
+        .unwrap_or(true);
+    if changed {
+        if let Ok(mut reg) = MON_REG.lock() {
+            reg.clear();
+            for (i, m) in winapi_util::monitors().iter().enumerate().take(8) {
+                if let Some(list) = cfg.mon_hk.get(&m.device) {
+                    for (k, e) in list.iter().enumerate().take(8) {
+                        if let Some((mods, vk)) = crate::hotkey::parse(&e.spec) {
+                            reg.push((100 + (i as i32) * 10 + k as i32, m.device.clone(), e.act, e.step, mods, vk));
+                        }
                     }
                 }
             }
+        }
+        if let Ok(mut s) = LAST_STRUCT.lock() {
+            *s = structural;
         }
     }
     if let Ok(mut guard) = SELECTION.lock() {
@@ -224,7 +256,7 @@ unsafe fn apply_visual() {
                 .unwrap_or(MAX_LEVEL + 1.0);
             let (alpha, want) = if own <= MAX_LEVEL {
                 let a = (own.clamp(0.0, MAX_LEVEL) * 255.0 / 100.0).round() as u8;
-                (a, a > 0 && want)
+                (a, a > 0)
             } else {
                 (alpha, want)
             };
@@ -499,6 +531,7 @@ unsafe extern "system" fn control_proc(
                 LRESULT(0)
             }
             WM_DISPLAYCHANGE => {
+                winapi_util::invalidate_monitors();
                 let overlay_class = wide(OVERLAY_CLASS);
                 let title = wide(WINDOW_TITLE);
                 let hinstance = HINSTANCE(GetModuleHandleW(None).map(|m| m.0).unwrap_or_default());

@@ -30,7 +30,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
     WM_ENTERSIZEMOVE, WM_ERASEBKGND, WM_EXITSIZEMOVE, WM_GETMINMAXINFO, WM_KEYDOWN,
     WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_PAINT, WM_SETICON, WM_SIZE, WM_SYSKEYDOWN,
     GCLP_HICON, GCLP_HICONSM, ICON_BIG, ICON_SMALL, ICON_SMALL2, GetSystemMetrics,
-    SM_CXICON, SM_CXSMICON, SetClassLongPtrW,
+    SM_CXICON, SM_CXSMICON, SetClassLongPtrW, DestroyIcon,
     WM_DISPLAYCHANGE, WM_DPICHANGED, WM_SETTINGCHANGE, WM_TIMER, WNDCLASSW, WS_EX_APPWINDOW, WS_MAXIMIZEBOX, WS_MINIMIZEBOX, WS_OVERLAPPEDWINDOW,
     WS_SYSMENU,
 };
@@ -158,25 +158,7 @@ impl Draw {
         if let Some(v) = self.fonts.get(&key) {
             return HFONT(*v as *mut c_void);
         }
-        let face = wide("Microsoft YaHei UI");
-        let f = unsafe {
-            CreateFontW(
-                -h,
-                0,
-                0,
-                0,
-                if bold { 700 } else { 400 },
-                0,
-                0,
-                0,
-                DEFAULT_CHARSET,
-                OUT_TT_PRECIS,
-                CLIP_DEFAULT_PRECIS,
-                CLEARTYPE_QUALITY,
-                DEFAULT_PITCH.0 as u32,
-                PCWSTR(face.as_ptr()),
-            )
-        };
+        let f = crate::winapi_util::cached_font(h, bold);
         self.fonts.insert(key, f.0 as isize);
         f
     }
@@ -730,14 +712,32 @@ fn record(g: &mut Gui, id: Id, r: RECT) {
     ));
 }
 
+static ICONS: std::sync::Mutex<(isize, isize, i32)> = std::sync::Mutex::new((0, 0, -1));
+
 fn set_window_icons(hwnd: HWND, dark: bool) {
     unsafe {
         let sm = GetSystemMetrics(SM_CXSMICON).max(16);
         let lg = GetSystemMetrics(SM_CXICON).max(32);
+        {
+            let cur = ICONS.lock().unwrap();
+            if cur.2 == dark as i32 && cur.0 != 0 && cur.1 != 0 {
+                return;
+            }
+        }
         let big = crate::icon::hicon(dark, lg);
         let small = crate::icon::hicon(dark, sm);
         if small.0.is_null() || big.0.is_null() {
             return;
+        }
+        {
+            let mut cur = ICONS.lock().unwrap();
+            if cur.0 != 0 {
+                let _ = DestroyIcon(windows::Win32::UI::WindowsAndMessaging::HICON(cur.0 as *mut c_void));
+            }
+            if cur.1 != 0 {
+                let _ = DestroyIcon(windows::Win32::UI::WindowsAndMessaging::HICON(cur.1 as *mut c_void));
+            }
+            *cur = (big.0 as isize, small.0 as isize, dark as i32);
         }
         for (kind, h) in [(ICON_BIG, big), (ICON_SMALL, small), (ICON_SMALL2, small)] {
             let _ = windows::Win32::UI::WindowsAndMessaging::SendMessageW(hwnd, WM_SETICON, Some(WPARAM(kind as usize)), Some(LPARAM(h.0 as isize)));

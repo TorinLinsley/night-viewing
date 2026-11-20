@@ -1,5 +1,5 @@
 // 快捷键提示与托盘小面板：置顶无边框浮层
-use std::sync::atomic::{AtomicBool, AtomicIsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicIsize, AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -26,7 +26,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
     ShowWindow, TranslateMessage, GWLP_USERDATA, HWND_TOPMOST, IDC_ARROW, LWA_ALPHA,
     MSG, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SW_HIDE, SW_SHOWNOACTIVATE, WNDCLASSW,
     WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP, WM_DESTROY,
-    WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE, WM_PAINT, WM_TIMER,
+    WM_ERASEBKGND, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE, WM_PAINT, WM_TIMER,
 };
 
 use crate::config::{MAX_LEVEL, OsdMode};
@@ -203,25 +203,7 @@ impl Paint {
         if let Some(v) = self.fonts.iter().find(|(k, _)| *k == key) {
             return HFONT(v.1 as *mut core::ffi::c_void);
         }
-        let face = wide("Microsoft YaHei UI");
-        let f = unsafe {
-            CreateFontW(
-                -h,
-                0,
-                0,
-                0,
-                if bold { 700 } else { 400 },
-                0,
-                0,
-                0,
-                DEFAULT_CHARSET,
-                OUT_TT_PRECIS,
-                CLIP_DEFAULT_PRECIS,
-                CLEARTYPE_QUALITY,
-                DEFAULT_PITCH.0 as u32,
-                PCWSTR(face.as_ptr()),
-            )
-        };
+        let f = crate::winapi_util::cached_font(h, bold);
         self.fonts.push((key, f.0 as isize));
         f
     }
@@ -360,6 +342,7 @@ struct State {
     monitors: Vec<winapi_util::Monitor>,
     dark: bool,
     click_prev: bool,
+    rgn: (i32, i32),
 }
 
 unsafe fn monitor_icon(p: &mut Paint, x: f32, y: f32, size: f32, color: u32) {
@@ -469,7 +452,7 @@ unsafe fn paint(hwnd: HWND, st: &mut State) {
     let _ = EndPaint(hwnd, &ps);
 }
 
-unsafe fn layout(hwnd: HWND, st: &State) {
+unsafe fn layout(hwnd: HWND, st: &mut State) {
     let s = cur_scale(hwnd);
     let count = st.monitors.len().max(1);
     let rows = 1 + count;
@@ -481,8 +464,11 @@ unsafe fn layout(hwnd: HWND, st: &State) {
     let y = (work.bottom - h - gap).max(work.top);
     let rad = (12.0 * s).round() as i32;
     unsafe {
-        let rgn = CreateRoundRectRgn(0, 0, w + 1, h + 1, rad, rad);
-        let _ = windows::Win32::Graphics::Gdi::SetWindowRgn(hwnd, Some(rgn), true);
+        if st.rgn != (w, h) {
+            let rgn = CreateRoundRectRgn(0, 0, w + 1, h + 1, rad, rad);
+            let _ = windows::Win32::Graphics::Gdi::SetWindowRgn(hwnd, Some(rgn), true);
+            st.rgn = (w, h);
+        }
         let _ = SetWindowPos(
             hwnd,
             Some(HWND_TOPMOST),
@@ -579,6 +565,15 @@ unsafe extern "system" fn osd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam:
                 let _ = ShowWindow(hwnd, SW_HIDE);
                 LRESULT(0)
             }
+            WM_ERASEBKGND => {
+                let hdc = HDC(wparam.0 as *mut _);
+                let mut rc = RECT::default();
+                let _ = GetClientRect(hwnd, &mut rc);
+                let brush = CreateSolidBrush(cref(style(st.dark).card));
+                FillRect(hdc, &rc, brush);
+                let _ = DeleteObject(brush.into());
+                LRESULT(1)
+            }
             WM_PAINT => {
                 paint(hwnd, st);
                 LRESULT(0)
@@ -607,6 +602,7 @@ unsafe extern "system" fn osd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam:
                 if rev != st.rev {
                     st.rev = rev;
                     let _ = InvalidateRect(Some(hwnd), None, false);
+                    let _ = UpdateWindow(hwnd);
                 }
                 let visible = IsWindowVisible(hwnd).as_bool();
                 if visible {
@@ -632,6 +628,7 @@ unsafe extern "system" fn osd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam:
                 if let Some(idx) = st.drag {
                     set_from_x(hwnd, st, idx, x);
                     let _ = InvalidateRect(Some(hwnd), None, false);
+                    let _ = UpdateWindow(hwnd);
                 } else if hit(&st.rows, x, y).is_some() {
                     st.hide_at = Instant::now() + Duration::from_millis(2000);
                 }
@@ -644,6 +641,7 @@ unsafe extern "system" fn osd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam:
                     let _ = SetCapture(hwnd);
                     set_from_x(hwnd, st, idx, x);
                     let _ = InvalidateRect(Some(hwnd), None, false);
+                    let _ = UpdateWindow(hwnd);
                 }
                 LRESULT(0)
             }
@@ -652,6 +650,7 @@ unsafe extern "system" fn osd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam:
                     let _ = ReleaseCapture();
                     st.drag = None;
                     let _ = InvalidateRect(Some(hwnd), None, false);
+                    let _ = UpdateWindow(hwnd);
                 }
                 LRESULT(0)
             }
@@ -682,7 +681,7 @@ fn run() {
             hInstance: hinstance,
             hIcon: Default::default(),
             hCursor: LoadCursorW(None, IDC_ARROW).unwrap_or_default(),
-            hbrBackground: Default::default(),
+            hbrBackground: CreateSolidBrush(COLORREF(0x00221B1E)),
             lpszMenuName: PCWSTR::null(),
             lpszClassName: PCWSTR(class.as_ptr()),
         };
@@ -720,6 +719,7 @@ fn run() {
                 monitors: winapi_util::monitors(),
                 dark: DARK.load(Ordering::Relaxed),
                 click_prev: false,
+                rgn: (0, 0),
             });
             SetWindowLongPtrW(hwnd, GWLP_USERDATA, Box::into_raw(state) as isize);
             let _ = SetLayeredWindowAttributes(hwnd, COLORREF(0), 250, LWA_ALPHA);

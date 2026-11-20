@@ -2,8 +2,10 @@
 use windows::core::{BOOL, PCWSTR};
 use windows::Win32::Foundation::{LPARAM, RECT};
 use windows::Win32::Graphics::Gdi::{
+    CLEARTYPE_QUALITY, CLIP_DEFAULT_PRECIS, CreateFontW, DEFAULT_CHARSET, DEFAULT_PITCH,
     DISPLAY_DEVICEW, EnumDisplayDevicesW, EnumDisplayMonitors, GetDC, GetDeviceCaps,
-    GetMonitorInfoW, HDC, HMONITOR, LOGPIXELSX, MONITORINFO, MONITORINFOEXW, ReleaseDC,
+    GetMonitorInfoW, HDC, HFONT, HMONITOR, LOGPIXELSX, MONITORINFO, MONITORINFOEXW, OUT_TT_PRECIS,
+    ReleaseDC,
 };
 use windows::Win32::Devices::Display::{
     DisplayConfigGetDeviceInfo, GetDisplayConfigBufferSizes, QueryDisplayConfig,
@@ -21,6 +23,41 @@ use windows::Win32::System::Registry::{
 
 const RUN_KEY: &str = "Software\\Microsoft\\Windows\\CurrentVersion\\Run";
 const VALUE_NAME: &str = "NightViewing";
+
+static FONT_CACHE: std::sync::Mutex<Option<std::collections::HashMap<i32, isize>>> =
+    std::sync::Mutex::new(None);
+
+pub fn cached_font(height: i32, bold: bool) -> HFONT {
+    let key = height + if bold { 1_000_000 } else { 0 };
+    if let Ok(mut slot) = FONT_CACHE.lock() {
+        let map = slot.get_or_insert_with(std::collections::HashMap::new);
+        if let Some(v) = map.get(&key) {
+            return HFONT(*v as *mut core::ffi::c_void);
+        }
+        let face = wide("Microsoft YaHei UI");
+        let f = unsafe {
+            CreateFontW(
+                -height,
+                0,
+                0,
+                0,
+                if bold { 700 } else { 400 },
+                0,
+                0,
+                0,
+                DEFAULT_CHARSET,
+                OUT_TT_PRECIS,
+                CLIP_DEFAULT_PRECIS,
+                CLEARTYPE_QUALITY,
+                DEFAULT_PITCH.0 as u32,
+                PCWSTR(face.as_ptr()),
+            )
+        };
+        map.insert(key, f.0 as isize);
+        return f;
+    }
+    HFONT::default()
+}
 
 fn wide(s: &str) -> Vec<u16> {
     s.encode_utf16().chain(std::iter::once(0)).collect()
@@ -251,8 +288,79 @@ fn friendly_names() -> std::collections::HashMap<String, String> {
     map
 }
 
+static MON_GEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+static MON_CACHE: std::sync::Mutex<Option<(std::time::Instant, Vec<Monitor>)>> =
+    std::sync::Mutex::new(None);
+static FRIENDLY: std::sync::RwLock<Option<std::collections::HashMap<String, String>>> =
+    std::sync::RwLock::new(None);
+static FRIENDLY_STARTED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+fn ensure_friendly_refresh() {
+    if FRIENDLY_STARTED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+        return;
+    }
+    let _ = std::thread::Builder::new()
+        .name("night-viewing-names".into())
+        .spawn(|| loop {
+            let map = friendly_names();
+            if !map.is_empty() {
+                if let Ok(mut w) = FRIENDLY.write() {
+                    *w = Some(map);
+                }
+            }
+            std::thread::sleep(std::time::Duration::from_secs(30));
+        });
+}
+
+fn friendly_lookup(device: &str) -> String {
+    FRIENDLY
+        .read()
+        .ok()
+        .and_then(|g| g.as_ref().and_then(|m| m.get(device).cloned()))
+        .unwrap_or_default()
+}
+
+pub fn monitor_generation() -> u64 {
+    MON_GEN.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+pub fn invalidate_monitors() {
+    if let Ok(mut cache) = MON_CACHE.lock() {
+        *cache = None;
+    }
+}
+
 pub fn monitors() -> Vec<Monitor> {
-    let mut sink = Collect { items: Vec::new(), names: friendly_names() };
+    ensure_friendly_refresh();
+    if let Ok(cache) = MON_CACHE.lock() {
+        if let Some((at, items)) = cache.as_ref() {
+            if at.elapsed() < std::time::Duration::from_millis(1000) {
+                return items.clone();
+            }
+        }
+    }
+    let items = monitors_fresh();
+    let changed = match MON_CACHE.lock() {
+        Ok(mut cache) => {
+            let prev: Option<Vec<String>> = cache
+                .as_ref()
+                .map(|(_, old)| old.iter().map(|m| m.device.clone()).collect());
+            let now: Vec<String> = items.iter().map(|m| m.device.clone()).collect();
+            let differs = prev.as_ref().map(|p| p != &now).unwrap_or(true);
+            *cache = Some((std::time::Instant::now(), items.clone()));
+            differs
+        }
+        Err(_) => false,
+    };
+    if changed {
+        MON_GEN.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+    items
+}
+
+fn monitors_fresh() -> Vec<Monitor> {
+    let mut sink = Collect { items: Vec::new(), names: std::collections::HashMap::new() };
     unsafe {
         let _ = EnumDisplayMonitors(
             None,
@@ -262,6 +370,9 @@ pub fn monitors() -> Vec<Monitor> {
         );
     }
     let mut items = sink.items;
+    for m in items.iter_mut() {
+        m.friendly = friendly_lookup(&m.device);
+    }
     items.sort_by_key(|m| (m.rect.left, m.rect.top));
     items
 }
