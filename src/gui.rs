@@ -604,7 +604,8 @@ impl Gui {
     }
 
     fn set_level(&mut self, v: f32) {
-        self.push(|c| c.opacity = v.clamp(0.0, MAX_LEVEL));
+        self.core.set_level(None, v.clamp(0.0, MAX_LEVEL));
+        self.cfg = self.core.snapshot().0;
         if !self.editing {
             self.num = format!("{}", self.cfg.opacity.round() as i32);
         }
