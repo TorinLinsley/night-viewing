@@ -65,5 +65,12 @@ fn main() {
 
     osd::init(&core, for_dark);
     let tray = tray::init(&core, for_dark, cfg.lang);
+    let _ = std::thread::Builder::new()
+        .name("night-viewing-trim".into())
+        .stack_size(64 * 1024)
+        .spawn(|| loop {
+            winapi_util::trim_memory();
+            std::thread::sleep(std::time::Duration::from_secs(10));
+        });
     gui::run(core, for_dark, tray);
 }

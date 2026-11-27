@@ -135,6 +135,7 @@ pub fn spawn(core: Arc<Core>) {
     let _ = CORE.set(core);
     std::thread::Builder::new()
         .name("night-viewing-overlay".into())
+        .stack_size(256 * 1024)
         .spawn(run)
         .ok();
 }
@@ -281,7 +282,7 @@ unsafe fn apply_visual() {
             if topmost {
                 let _ = SetWindowPos(
                     hwnd,
-                    Some(HWND_TOPMOST),
+                    crate::osd::anchor().or(Some(HWND_TOPMOST)),
                     0,
                     0,
                     0,
@@ -292,7 +293,6 @@ unsafe fn apply_visual() {
                 );
             }
         }
-        crate::osd::raise();
     }
 }
 

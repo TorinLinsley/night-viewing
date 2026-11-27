@@ -29,6 +29,7 @@
 - 显示器列表自动枚举，显示真实的显示器名称（如 `NE160WUM-NX2`）与分辨率，主屏带徽标
 - 每块屏的遮罩可以**单独关闭**（关闭后该屏完全不叠加任何东西）
 - 悬浮提示与托盘面板里有「全部显示器」总控行，一次同步所有屏；下面是每块屏的独立滑块
+- 新增「连接屏幕管理」板块：已保存过独立快捷键的显示器即使暂时断开也会保留在列表里，可在这里查看其名称 / 分辨率 / 刷新率、展开修改或删除它的按键配置；当前正在连接的屏幕也可以用 × 清空该屏的按键配置，断开且没配置过的屏幕会自动消失
 
 ### 快捷键
 
@@ -93,7 +94,7 @@ cargo build --release
 - **分层窗口**：每块显示器一个 `WS_EX_LAYERED | WS_EX_TRANSPARENT | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE` 的弹出窗口，用 `SetLayeredWindowAttributes` 调 alpha
 - **DPI**：进程启动即 `SetProcessDpiAwarenessContext(PER_MONITOR_AWARE_V2)`，并用 `GetDpiForWindow` 适配 100% ~ 200% 缩放
 - **热键**：`RegisterHotKey` 挂在消息专用窗口上，注册失败自动降级到备用键位，并在日志中记录原因
-- **内存**：无 GPU 渲染、无 WebView，release 构建开启 `lto`、`opt-level = "s"`、`panic = "abort"`、`strip`
+- **内存**：常驻托盘时私有工作集约 450 KB，打开主界面约 420 KB（任务管理器「内存」列同口径），进程总工作集约 750 KB ~ 1.2 MB；无 GPU 渲染、无 WebView，release 构建开启 `lto`、`opt-level = "s"`、`panic = "abort"`、`strip`，并每 10 秒 `SetProcessWorkingSetSize` 回收工作集
 
 ## 已知限制
 

@@ -14,7 +14,7 @@ use windows::Win32::Devices::Display::{
     DISPLAYCONFIG_TARGET_DEVICE_NAME, QDC_ONLY_ACTIVE_PATHS,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    MONITORINFOF_PRIMARY, SPI_GETWORKAREA, SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS, SystemParametersInfoW,
+    GetSystemMetrics, MONITORINFOF_PRIMARY, SM_CMONITORS, SPI_GETWORKAREA, SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS, SystemParametersInfoW,
 };
 use windows::Win32::System::Registry::{
     HKEY, HKEY_CURRENT_USER, KEY_SET_VALUE, REG_SZ, RRF_RT_REG_DWORD, RRF_RT_REG_SZ, RegCloseKey,
@@ -130,6 +130,13 @@ pub fn set_dpi_aware() {
     }
 }
 
+pub fn trim_memory() {
+    unsafe {
+        use windows::Win32::System::Threading::{GetCurrentProcess, SetProcessWorkingSetSize};
+        let _ = SetProcessWorkingSetSize(GetCurrentProcess(), usize::MAX, usize::MAX);
+    }
+}
+
 pub fn system_scale() -> f32 {
     unsafe {
         let dc = GetDC(None);
@@ -189,6 +196,7 @@ pub struct Monitor {
     pub friendly: String,
     pub rect: RECT,
     pub primary: bool,
+    pub refresh: u32,
 }
 
 impl Monitor {
@@ -199,11 +207,20 @@ impl Monitor {
     pub fn height(&self) -> i32 {
         self.rect.bottom - self.rect.top
     }
+
+    pub fn info(&self) -> String {
+        if self.refresh > 0 {
+            format!("{}×{} · {} Hz", self.width(), self.height(), self.refresh)
+        } else {
+            format!("{}×{}", self.width(), self.height())
+        }
+    }
 }
 
 struct Collect {
     items: Vec<Monitor>,
     names: std::collections::HashMap<String, String>,
+    rates: std::collections::HashMap<String, u32>,
 }
 
 unsafe extern "system" fn collect(hmon: HMONITOR, _hdc: HDC, _rect: *mut RECT, data: LPARAM) -> BOOL {
@@ -226,12 +243,14 @@ unsafe extern "system" fn collect(hmon: HMONITOR, _hdc: HDC, _rect: *mut RECT, d
             name = String::from_utf16_lossy(&dd.DeviceString[..end]);
         }
         let friendly = sink.names.get(&device).cloned().unwrap_or_default();
+        let refresh = sink.rates.get(&device).copied().unwrap_or(0);
         sink.items.push(Monitor {
             device,
             name,
             friendly,
             rect: info.monitorInfo.rcMonitor,
             primary: info.monitorInfo.dwFlags & MONITORINFOF_PRIMARY != 0,
+            refresh,
         });
     }
     BOOL(1)
@@ -288,13 +307,110 @@ fn friendly_names() -> std::collections::HashMap<String, String> {
     map
 }
 
+fn refresh_rates() -> std::collections::HashMap<String, u32> {
+    let mut map = std::collections::HashMap::new();
+    unsafe {
+        let mut paths = 0u32;
+        let mut modes = 0u32;
+        if GetDisplayConfigBufferSizes(QDC_ONLY_ACTIVE_PATHS, &mut paths, &mut modes).0 != 0 {
+            return map;
+        }
+        let mut path_buf = vec![DISPLAYCONFIG_PATH_INFO::default(); paths as usize];
+        let mut mode_buf = vec![DISPLAYCONFIG_MODE_INFO::default(); modes as usize];
+        if QueryDisplayConfig(
+            QDC_ONLY_ACTIVE_PATHS,
+            &mut paths,
+            path_buf.as_mut_ptr(),
+            &mut modes,
+            mode_buf.as_mut_ptr(),
+            None,
+        )
+        .0 != 0
+        {
+            return map;
+        }
+        for path in path_buf.iter().take(paths as usize) {
+            let rate = path.targetInfo.refreshRate;
+            let hz = if rate.Denominator == 0 {
+                0
+            } else {
+                (rate.Numerator as f64 / rate.Denominator as f64).round() as u32
+            };
+            if hz == 0 {
+                continue;
+            }
+            let mut src = DISPLAYCONFIG_SOURCE_DEVICE_NAME::default();
+            src.header.r#type = DISPLAYCONFIG_DEVICE_INFO_GET_SOURCE_NAME;
+            src.header.size = std::mem::size_of::<DISPLAYCONFIG_SOURCE_DEVICE_NAME>() as u32;
+            src.header.adapterId = path.sourceInfo.adapterId;
+            src.header.id = path.sourceInfo.id;
+            if DisplayConfigGetDeviceInfo(&mut src.header) != 0 {
+                continue;
+            }
+            let end = src.viewGdiDeviceName.iter().position(|c| *c == 0).unwrap_or(0);
+            if end > 0 {
+                let dev = String::from_utf16_lossy(&src.viewGdiDeviceName[..end]);
+                map.insert(dev, hz);
+            }
+        }
+    }
+    map
+}
+
+fn active_sources() -> Option<std::collections::HashSet<String>> {
+    unsafe {
+        let mut paths = 0u32;
+        let mut modes = 0u32;
+        if GetDisplayConfigBufferSizes(QDC_ONLY_ACTIVE_PATHS, &mut paths, &mut modes).0 != 0 {
+            return None;
+        }
+        let mut path_buf = vec![DISPLAYCONFIG_PATH_INFO::default(); paths as usize];
+        let mut mode_buf = vec![DISPLAYCONFIG_MODE_INFO::default(); modes as usize];
+        if QueryDisplayConfig(
+            QDC_ONLY_ACTIVE_PATHS,
+            &mut paths,
+            path_buf.as_mut_ptr(),
+            &mut modes,
+            mode_buf.as_mut_ptr(),
+            None,
+        )
+        .0 != 0
+        {
+            return None;
+        }
+        let mut set = std::collections::HashSet::new();
+        for path in path_buf.iter().take(paths as usize) {
+            let mut src = DISPLAYCONFIG_SOURCE_DEVICE_NAME::default();
+            src.header.r#type = DISPLAYCONFIG_DEVICE_INFO_GET_SOURCE_NAME;
+            src.header.size = std::mem::size_of::<DISPLAYCONFIG_SOURCE_DEVICE_NAME>() as u32;
+            src.header.adapterId = path.sourceInfo.adapterId;
+            src.header.id = path.sourceInfo.id;
+            if DisplayConfigGetDeviceInfo(&mut src.header) != 0 {
+                continue;
+            }
+            let end = src.viewGdiDeviceName.iter().position(|c| *c == 0).unwrap_or(0);
+            if end > 0 {
+                set.insert(String::from_utf16_lossy(&src.viewGdiDeviceName[..end]));
+            }
+        }
+        if set.is_empty() { None } else { Some(set) }
+    }
+}
+
 static MON_GEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 static MON_CACHE: std::sync::Mutex<Option<(std::time::Instant, Vec<Monitor>)>> =
     std::sync::Mutex::new(None);
 static FRIENDLY: std::sync::RwLock<Option<std::collections::HashMap<String, String>>> =
     std::sync::RwLock::new(None);
+static RATES: std::sync::RwLock<Option<std::collections::HashMap<String, u32>>> =
+    std::sync::RwLock::new(None);
 static FRIENDLY_STARTED: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
+static NAMES_REQ: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+pub fn request_names() {
+    NAMES_REQ.store(true, std::sync::atomic::Ordering::Relaxed);
+}
 
 fn ensure_friendly_refresh() {
     if FRIENDLY_STARTED.swap(true, std::sync::atomic::Ordering::Relaxed) {
@@ -302,6 +418,7 @@ fn ensure_friendly_refresh() {
     }
     let _ = std::thread::Builder::new()
         .name("night-viewing-names".into())
+        .stack_size(128 * 1024)
         .spawn(|| loop {
             let map = friendly_names();
             if !map.is_empty() {
@@ -309,8 +426,29 @@ fn ensure_friendly_refresh() {
                     *w = Some(map);
                 }
             }
-            std::thread::sleep(std::time::Duration::from_secs(30));
+            let rt = refresh_rates();
+            if !rt.is_empty() {
+                if let Ok(mut w) = RATES.write() {
+                    *w = Some(rt);
+                }
+            }
+            let mut ticks = 0u32;
+            while ticks < 60 {
+                std::thread::sleep(std::time::Duration::from_millis(500));
+                ticks += 1;
+                if NAMES_REQ.swap(false, std::sync::atomic::Ordering::Relaxed) {
+                    break;
+                }
+            }
         });
+}
+
+fn rate_lookup(device: &str) -> u32 {
+    RATES
+        .read()
+        .ok()
+        .and_then(|g| g.as_ref().and_then(|m| m.get(device).copied()))
+        .unwrap_or(0)
 }
 
 fn friendly_lookup(device: &str) -> String {
@@ -333,9 +471,12 @@ pub fn invalidate_monitors() {
 
 pub fn monitors() -> Vec<Monitor> {
     ensure_friendly_refresh();
+    let live = unsafe { GetSystemMetrics(SM_CMONITORS) } as usize;
     if let Ok(cache) = MON_CACHE.lock() {
         if let Some((at, items)) = cache.as_ref() {
-            if at.elapsed() < std::time::Duration::from_millis(1000) {
+            if at.elapsed() < std::time::Duration::from_millis(1000)
+                && (live == 0 || live == items.len())
+            {
                 return items.clone();
             }
         }
@@ -360,7 +501,11 @@ pub fn monitors() -> Vec<Monitor> {
 }
 
 fn monitors_fresh() -> Vec<Monitor> {
-    let mut sink = Collect { items: Vec::new(), names: std::collections::HashMap::new() };
+    let mut sink = Collect {
+        items: Vec::new(),
+        names: std::collections::HashMap::new(),
+        rates: std::collections::HashMap::new(),
+    };
     unsafe {
         let _ = EnumDisplayMonitors(
             None,
@@ -370,8 +515,19 @@ fn monitors_fresh() -> Vec<Monitor> {
         );
     }
     let mut items = sink.items;
+    if let Some(active) = active_sources() {
+        items.retain(|m| active.contains(&m.device));
+    }
+    let mut missing = false;
     for m in items.iter_mut() {
         m.friendly = friendly_lookup(&m.device);
+        if m.friendly.is_empty() {
+            missing = true;
+        }
+        m.refresh = rate_lookup(&m.device);
+    }
+    if missing {
+        request_names();
     }
     items.sort_by_key(|m| (m.rect.left, m.rect.top));
     items

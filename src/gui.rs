@@ -1,7 +1,8 @@
 // 原生 GDI 界面：窗口、绘制、鼠标与键盘交互
 use std::collections::HashMap;
 use std::ffi::c_void;
-use std::sync::Arc;
+use std::sync::atomic::{AtomicIsize, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use tray_icon::TrayIcon;
@@ -19,7 +20,7 @@ use windows::Win32::Graphics::Gdi::{
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::HiDpi::GetDpiForWindow;
-use windows::Win32::UI::Input::KeyboardAndMouse::{ReleaseCapture, SetCapture, VK_BACK, VK_DOWN, VK_END, VK_HOME, VK_LEFT, VK_RIGHT, VK_TAB, VK_UP, VK_ESCAPE};
+use windows::Win32::UI::Input::KeyboardAndMouse::{GetAsyncKeyState, ReleaseCapture, SetCapture, VK_BACK, VK_DOWN, VK_END, VK_HOME, VK_LEFT, VK_RIGHT, VK_TAB, VK_UP, VK_ESCAPE};
 use windows::Win32::UI::WindowsAndMessaging::{
     AdjustWindowRect, CS_HREDRAW, CS_VREDRAW, CreateWindowExW, DefWindowProcW, DispatchMessageW,
     GWLP_USERDATA, SetWindowTextW, GetClientRect, GetMessageW, GetWindowLongPtrW, IDC_ARROW, LoadCursorW, MINMAXINFO, MSG,
@@ -27,12 +28,12 @@ use windows::Win32::UI::WindowsAndMessaging::{
     GetCursorPos, SWP_NOSIZE, SetWindowPos, ShowWindow, SystemParametersInfoW, TranslateMessage,
     SPI_GETWORKAREA,
     SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS, WM_CHAR, WM_CLOSE, WM_CREATE, WM_DESTROY,
-    WM_ENTERSIZEMOVE, WM_ERASEBKGND, WM_EXITSIZEMOVE, WM_GETMINMAXINFO, WM_KEYDOWN,
-    WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_PAINT, WM_SETICON, WM_SIZE, WM_SYSKEYDOWN,
+    WM_ENTERSIZEMOVE, WM_ERASEBKGND, WM_EXITSIZEMOVE, WM_GETMINMAXINFO, WM_KEYDOWN, WM_KEYUP,
+    WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_PAINT, WM_SETICON, WM_SIZE, WM_SYSKEYDOWN, WM_SYSKEYUP,
     GCLP_HICON, GCLP_HICONSM, ICON_BIG, ICON_SMALL, ICON_SMALL2, GetSystemMetrics,
     SM_CXICON, SM_CXSMICON, SetClassLongPtrW, DestroyIcon,
     WM_DISPLAYCHANGE, WM_DPICHANGED, WM_SETTINGCHANGE, WM_TIMER, WNDCLASSW, WS_EX_APPWINDOW, WS_MAXIMIZEBOX, WS_MINIMIZEBOX, WS_OVERLAPPEDWINDOW,
-    WS_SYSMENU,
+    WS_SYSMENU, SetWindowsHookExW, UnhookWindowsHookEx, CallNextHookEx, HHOOK, WH_KEYBOARD_LL, PostMessageW, KBDLLHOOKSTRUCT,
 };
 
 use crate::config::{Config, MonKey, OsdMode, ThemeMode, MAX_LEVEL};
@@ -54,6 +55,151 @@ const T_HOTKEY: u8 = 3;
 const T_PASS: u8 = 4;
 const T_TOP: u8 = 5;
 
+static CAPTURING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+static CAP_HOOK: AtomicIsize = AtomicIsize::new(0);
+static CAP_HWND: AtomicIsize = AtomicIsize::new(0);
+static CAP_VK: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+static CAP_MODS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+static PRESSED: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+static CAP_SPEC: Mutex<Option<String>> = Mutex::new(None);
+static CAP_SINCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+const WM_CAPTURED: u32 = 0x0400 + 11;
+
+fn mod_bit(vk: u32) -> u32 {
+    match vk {
+        0x11 | 0xA2 => 1,
+        0xA3 => 2,
+        0x10 | 0xA0 => 4,
+        0xA1 => 8,
+        0x12 | 0xA4 => 16,
+        0xA5 => 32,
+        0x5B => 64,
+        0x5C => 128,
+        _ => 0,
+    }
+}
+
+fn is_modifier(vk: u32) -> bool {
+    matches!(vk, 0x10 | 0x11 | 0x12 | 0x5B | 0x5C | 0xA0 | 0xA1 | 0xA2 | 0xA3 | 0xA4 | 0xA5)
+}
+
+fn tracked_mods() -> u32 {
+    let bits = PRESSED.load(Ordering::Relaxed);
+    let mut mods = 0;
+    if bits & 3 != 0 {
+        mods |= crate::hotkey::M_CTRL;
+    }
+    if bits & 12 != 0 {
+        mods |= crate::hotkey::M_SHIFT;
+    }
+    if bits & 48 != 0 {
+        mods |= crate::hotkey::M_ALT;
+    }
+    if bits & 192 != 0 {
+        mods |= crate::hotkey::M_WIN;
+    }
+    mods
+}
+
+fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+fn start_capture(hwnd: HWND) {
+    CAP_HWND.store(hwnd.0 as isize, Ordering::SeqCst);
+    CAPTURING.store(true, Ordering::SeqCst);
+    CAP_SINCE.store(now_ms(), Ordering::SeqCst);
+    if CAP_HOOK.load(Ordering::SeqCst) == 0 {
+        PRESSED.store(0, Ordering::SeqCst);
+        let _ = std::thread::Builder::new()
+            .name("night-viewing-hook".to_string())
+            .stack_size(64 * 1024)
+            .spawn(|| unsafe {
+                let mut hook: HHOOK = HHOOK(std::ptr::null_mut());
+                if let Ok(h) = SetWindowsHookExW(WH_KEYBOARD_LL, Some(cap_hook), None, 0) {
+                    hook = h;
+                    CAP_HOOK.store(h.0 as isize, Ordering::SeqCst);
+                }
+                let mut msg = MSG::default();
+                while GetMessageW(&mut msg, None, 0, 0).0 > 0 {}
+                if !hook.is_invalid() {
+                    let _ = UnhookWindowsHookEx(hook);
+                }
+                CAP_HOOK.store(0, Ordering::SeqCst);
+            });
+        for _ in 0..80 {
+            if CAP_HOOK.load(Ordering::SeqCst) != 0 {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+    }
+}
+
+fn stop_capture() {
+    CAPTURING.store(false, Ordering::SeqCst);
+    PRESSED.store(0, Ordering::SeqCst);
+    if let Ok(mut s) = CAP_SPEC.lock() {
+        *s = None;
+    }
+}
+
+unsafe extern "system" fn cap_hook(code: i32, w: WPARAM, l: LPARAM) -> LRESULT {
+    if code < 0 {
+        return CallNextHookEx(None, code, w, l);
+    }
+    let m = w.0 as u32;
+    let kb = &*(l.0 as *const KBDLLHOOKSTRUCT);
+    let vk = kb.vkCode;
+    let down = m == WM_KEYDOWN || m == WM_SYSKEYDOWN;
+    let up = m == WM_KEYUP || m == WM_SYSKEYUP;
+    let bit = mod_bit(vk);
+    if bit != 0 {
+        if down {
+            PRESSED.fetch_or(bit, Ordering::SeqCst);
+        } else if up {
+            PRESSED.fetch_and(!bit, Ordering::SeqCst);
+        }
+    }
+    if CAPTURING.load(Ordering::SeqCst) && now_ms().saturating_sub(CAP_SINCE.load(Ordering::SeqCst)) > 120_000 {
+        CAPTURING.store(false, Ordering::SeqCst);
+    }
+    if !CAPTURING.load(Ordering::SeqCst) {
+        return CallNextHookEx(None, code, w, l);
+    }
+    if vk == 0x2C {
+        return CallNextHookEx(None, code, w, l);
+    }
+    if down && is_modifier(vk) {
+        return LRESULT(1);
+    }
+    if down {
+        let hwnd = HWND(CAP_HWND.load(Ordering::SeqCst) as *mut c_void);
+        if vk == 0x1B {
+            CAP_VK.store(0, Ordering::SeqCst);
+            CAP_MODS.store(0, Ordering::SeqCst);
+            CAPTURING.store(false, Ordering::SeqCst);
+            let _ = PostMessageW(Some(hwnd), WM_CAPTURED, WPARAM(0), LPARAM(0));
+            return LRESULT(1);
+        }
+        let mods = tracked_mods();
+        if mods != 0 && vk >= 0x08 && vk <= 0xFE && vk != 0xE7 {
+            CAP_VK.store(vk, Ordering::SeqCst);
+            CAP_MODS.store(mods, Ordering::SeqCst);
+            CAPTURING.store(false, Ordering::SeqCst);
+            let _ = PostMessageW(Some(hwnd), WM_CAPTURED, WPARAM(0), LPARAM(0));
+        }
+        return LRESULT(1);
+    }
+    if up && is_modifier(vk) {
+        return LRESULT(1);
+    }
+    CallNextHookEx(None, code, w, l)
+}
+
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Id {
     Slider,
@@ -62,14 +208,16 @@ enum Id {
     Seg(usize),
     Toggle(u8),
     HkChip(u8),
-    MonHead(usize),
-    MonKey(usize, usize),
-    MonAct(usize, usize),
-    MonActItem(usize, usize, u8),
-    MonDel(usize, usize),
-    MonAdd(usize),
-    MonStep(usize, usize, usize),
-    MonStepIn(usize, usize),
+    HkReset(u8),
+    MonHead(usize, u8),
+    MonKey(usize, usize, u8),
+    MonAct(usize, usize, u8),
+    MonActItem(usize, usize, u8, u8),
+    MonDel(usize, usize, u8),
+    MonAdd(usize, u8),
+    MemDel(usize, u8),
+    MonStep(usize, usize, usize, u8),
+    MonStepIn(usize, usize, u8),
     StepUp(usize),
     StepDown(usize),
     StepIn(u8),
@@ -351,6 +499,14 @@ fn round_points(r: RECT, rad: i32) -> Vec<POINT> {
     pts
 }
 
+#[derive(Clone)]
+struct Block {
+    device: String,
+    label: String,
+    sub: String,
+    connected: bool,
+}
+
 pub struct Gui {
     core: Arc<Core>,
     cfg: Config,
@@ -379,6 +535,7 @@ pub struct Gui {
     tray_dark: Option<bool>,
     tray_auto: bool,
     monitors: Vec<winapi_util::Monitor>,
+    blocks: Vec<Block>,
     slider_rect: RECT,
     auto_h: bool,
     set_h: i32,
@@ -387,11 +544,14 @@ pub struct Gui {
     lang_scroll: f32,
     lang_max_scroll: f32,
     capture: Option<u8>,
-    mon_capture: Option<(usize, usize)>,
+    key_sel: Option<Id>,
+    held: u32,
+    mon_capture: Option<(usize, usize, u8)>,
     mon_step_edit: Option<(usize, usize)>,
     mon_step_text: String,
     mon_open: Vec<bool>,
-    mon_menu: Option<(usize, usize)>,
+    mem_open: Vec<bool>,
+    mon_menu: Option<(usize, usize, u8)>,
     mon_menu_rect: RECT,
 }
 
@@ -434,6 +594,7 @@ impl Gui {
             tray_dark: Some(for_dark),
             tray_auto: auto_init,
             monitors: winapi_util::monitors(),
+            blocks: Vec::new(),
             slider_rect: RECT::default(),
             auto_h: true,
             set_h: 0,
@@ -442,10 +603,13 @@ impl Gui {
             lang_scroll: 0.0,
             lang_max_scroll: 0.0,
             capture: None,
+            key_sel: None,
+            held: 0,
             mon_capture: None,
             mon_step_edit: None,
             mon_step_text: String::new(),
             mon_open: Vec::new(),
+            mem_open: Vec::new(),
             mon_menu: None,
             mon_menu_rect: RECT::default(),
         }
@@ -554,6 +718,86 @@ impl Gui {
         }
     }
 
+    fn rebuild_blocks(&mut self) {
+        let mons = crate::winapi_util::monitors();
+        let mut out: Vec<Block> = Vec::with_capacity(mons.len());
+        let mut names_changed = false;
+        for (i, m) in mons.iter().enumerate() {
+            let base = mon_name(self.cfg.lang, i);
+            let friendly = if m.friendly.is_empty() {
+                self.cfg.mon_names.get(&m.device).cloned().unwrap_or_default()
+            } else {
+                m.friendly.clone()
+            };
+            let name = if friendly.is_empty() {
+                base
+            } else {
+                format!("{}  {}", base, friendly)
+            };
+            if !m.friendly.is_empty() {
+                let cur = self.cfg.mon_names.get(&m.device).cloned().unwrap_or_default();
+                if cur != m.friendly {
+                    self.cfg.mon_names.insert(m.device.clone(), m.friendly.clone());
+                    names_changed = true;
+                }
+            }
+            let info = m.info();
+            if self.cfg.mon_meta.get(&m.device) != Some(&info) {
+                self.cfg.mon_meta.insert(m.device.clone(), info.clone());
+                names_changed = true;
+            }
+            out.push(Block {
+                device: m.device.clone(),
+                label: name,
+                sub: info,
+                connected: true,
+            });
+        }
+        let mut rest: Vec<String> = self
+            .cfg
+            .mon_hk
+            .iter()
+            .filter(|(d, l)| !l.is_empty() && !mons.iter().any(|m| &m.device == *d))
+            .map(|(d, _)| d.clone())
+            .collect();
+        rest.sort();
+        for dev in rest {
+            let label = self
+                .cfg
+                .mon_names
+                .get(&dev)
+                .cloned()
+                .unwrap_or_else(|| short_dev(&dev));
+            let sub = self
+                .cfg
+                .mon_meta
+                .get(&dev)
+                .cloned()
+                .unwrap_or_else(|| short_dev(&dev));
+            out.push(Block {
+                device: dev,
+                label,
+                sub,
+                connected: false,
+            });
+        }
+        self.blocks = out;
+        self.mon_open.resize(self.blocks.len(), false);
+        self.mem_open.resize(self.blocks.len(), false);
+        if names_changed {
+            let names = self.cfg.mon_names.clone();
+            let meta = self.cfg.mon_meta.clone();
+            self.core.update(move |c| {
+                c.mon_names = names;
+                c.mon_meta = meta;
+            });
+        }
+    }
+
+    fn dev_of(&self, i: usize) -> Option<String> {
+        self.blocks.get(i).map(|b| b.device.clone())
+    }
+
     fn commit_mon_step(&mut self) {
         let Some((i, k)) = self.mon_step_edit.take() else {
             return;
@@ -561,8 +805,7 @@ impl Gui {
         let text = self.mon_step_text.trim().to_string();
         if let Ok(v) = text.parse::<f32>() {
             let v = v.clamp(0.5, 30.0);
-            if let Some(mm) = crate::winapi_util::monitors().get(i) {
-                let dev = mm.device.clone();
+            if let Some(dev) = self.dev_of(i) {
                 let mut list = self.cfg.mon_entries(&dev);
                 if let Some(e) = list.get_mut(k) {
                     e.step = v;
@@ -638,6 +881,7 @@ fn fmt_step(v: f32) -> String {
 }
 
 fn paint_content(g: &mut Gui, hdc: HDC) {
+    g.rebuild_blocks();
     let pc = pal(g.dark);
     g.hits.clear();
     let mut rc = RECT::default();
@@ -673,6 +917,7 @@ fn paint_content(g: &mut Gui, hdc: HDC) {
         y = card_keys(&mut d, &pc, g, y);
         y = card_monkeys(&mut d, &pc, g, y);
         y = card_overlay(&mut d, &pc, g, y);
+        y = card_remembered(&mut d, &pc, g, y);
         y = footer(&mut d, &pc, g, y);
 
         y += 20.0;
@@ -1174,6 +1419,13 @@ fn card_appearance(d: &mut Draw, pc: &Pal, g: &mut Gui, y: f32) -> f32 {
 
 const MON_ACT_LABELS: [&str; 3] = ["加深", "减淡", "关闭"];
 
+const HK_DEFAULTS: [&str; 4] = [
+    "Ctrl+Alt+Shift+Up",
+    "Ctrl+Alt+Shift+Down",
+    "Ctrl+Alt+Shift+0",
+    "Ctrl+Alt+Shift+N",
+];
+
 fn mon_name(lang: Lang, i: usize) -> String {
     crate::i18n::tr(lang, &format!("显示器 {}", i + 1))
 }
@@ -1184,6 +1436,14 @@ fn glob_label(lang: Lang, act: &str) -> String {
         crate::i18n::ui(lang, "全局快捷键"),
         crate::i18n::ui(lang, act)
     )
+}
+
+fn short_dev(dev: &str) -> String {
+    dev.rsplit('\\').next().unwrap_or(dev).to_string()
+}
+
+fn block_label(base: &str, k: usize, act: &str, lang: Lang) -> String {
+    format!("{} {} · {}", base, k + 1, crate::i18n::ui(lang, act))
 }
 
 fn mon_label(lang: Lang, i: usize, k: usize, act: &str) -> String {
@@ -1217,13 +1477,20 @@ fn all_keys(cfg: &Config, lang: Lang) -> Vec<(String, String)> {
             v.push((spec, lab));
         }
     }
-    for (i, m) in crate::winapi_util::monitors().iter().enumerate() {
-        for (k, e) in cfg.mon_entries(&m.device).iter().enumerate() {
+    let mut devs: Vec<&String> = cfg.mon_hk.keys().collect();
+    devs.sort();
+    for dev in devs {
+        let base = cfg
+            .mon_names
+            .get(dev)
+            .cloned()
+            .unwrap_or_else(|| short_dev(dev));
+        for (k, e) in cfg.mon_entries(dev).iter().enumerate() {
             if e.spec.is_empty() {
                 continue;
             }
             let act = MON_ACT_LABELS[e.act.min(2) as usize];
-            v.push((e.spec.clone(), mon_label(lang, i, k, act)));
+            v.push((e.spec.clone(), block_label(&base, k, act, lang)));
         }
     }
     v
@@ -1247,12 +1514,13 @@ fn conflict_with(own: &str, label: &str, all: &[(String, String)], lang: Lang) -
 }
 
 fn key_chip(d: &mut Draw, pc: &Pal, g: &mut Gui, rect: RECT, id: Id, spec: &str, active: bool, bad: bool) {
-    let hot = active || g.hover == Some(id);
+    let sel = g.key_sel == Some(id);
+    let hot = active || sel || g.hover == Some(id);
     d.round(rect, 8.0, pc.track);
     if bad {
         d.stroke(rect, 8.0, 0xE5484D, 1.6);
     } else if hot {
-        d.stroke(rect, 8.0, if active { pc.accent } else { pc.stroke }, 1.4);
+        d.stroke(rect, 8.0, if active || sel { pc.accent } else { pc.stroke }, 1.4);
     }
     let shown = if active {
         "…  Esc".to_string()
@@ -1280,6 +1548,56 @@ fn key_chip(d: &mut Draw, pc: &Pal, g: &mut Gui, rect: RECT, id: Id, spec: &str,
         false,
     );
     record(g, id, rect);
+}
+
+fn captured_spec(held: u32, alt_bit: bool, sys: bool, vk: u16, down: &dyn Fn(u16) -> bool) -> Option<String> {
+    if vk < 0x08 || vk > 0xFE || vk == 0xE7 {
+        return None;
+    }
+    if [0x10u16, 0x11, 0x12, 0x5B, 0x5C].contains(&vk) {
+        return None;
+    }
+    let mut mods = held;
+    if alt_bit || sys {
+        mods |= crate::hotkey::M_ALT;
+    }
+    if down(0x11) {
+        mods |= crate::hotkey::M_CTRL;
+    }
+    if down(0x12) {
+        mods |= crate::hotkey::M_ALT;
+    }
+    if down(0x10) {
+        mods |= crate::hotkey::M_SHIFT;
+    }
+    if down(0x5B) || down(0x5C) {
+        mods |= crate::hotkey::M_WIN;
+    }
+    if mods == 0 {
+        None
+    } else {
+        Some(crate::hotkey::format(mods, vk as u32))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn capture_keeps_modifiers() {
+        use crate::hotkey::{M_ALT, M_CTRL, M_SHIFT};
+        let none = |_: u16| false;
+        assert_eq!(
+            super::captured_spec(M_CTRL | M_SHIFT, false, false, 0x56, &none).as_deref(),
+            Some("Ctrl+Shift+V")
+        );
+        assert_eq!(
+            super::captured_spec(M_CTRL, true, true, 0x56, &none).as_deref(),
+            Some("Ctrl+Alt+V")
+        );
+        assert_eq!(super::captured_spec(M_ALT, false, false, 0x56, &none).as_deref(), Some("Alt+V"));
+        assert_eq!(super::captured_spec(0, false, false, 0xFF, &none), None);
+        assert_eq!(super::captured_spec(M_CTRL, false, false, 0x10, &none), None);
+    }
 }
 
 fn card_keys(d: &mut Draw, pc: &Pal, g: &mut Gui, y: f32) -> f32 {
@@ -1311,15 +1629,20 @@ fn card_keys(d: &mut Draw, pc: &Pal, g: &mut Gui, y: f32) -> f32 {
         let rect = d.r(x0, ry, right - x0, 30.0);
         let id = Id::HkChip(*k);
         let active = g.capture == Some(*k);
+        let sel = g.key_sel == Some(id);
         d.round(rect, 8.0, pc.card);
         let bad = notes[i].is_some();
         if bad {
             d.stroke(rect, 8.0, 0xE5484D, 1.4);
-        } else if active || g.hover == Some(id) {
-            d.stroke(rect, 8.0, if active { pc.accent } else { pc.stroke }, 1.4);
+        } else if active || sel || g.hover == Some(id) {
+            d.stroke(rect, 8.0, if active || sel { pc.accent } else { pc.stroke }, 1.4);
         }
         d.text(d.r(x0 + 10.0, ry + 7.0, 170.0, 18.0), label, 10.5, pc.text, FMT_LEFT, false);
-        let shown = if active { "…  Esc".to_string() } else { spec.clone() };
+        let shown = if active {
+            "…  Esc".to_string()
+        } else {
+            crate::hotkey::normalize(spec)
+        };
         let col = if active {
             pc.accent
         } else if bad {
@@ -1328,7 +1651,7 @@ fn card_keys(d: &mut Draw, pc: &Pal, g: &mut Gui, y: f32) -> f32 {
             pc.dim
         };
         d.text(
-            d.r(right - 200.0, ry + 7.0, 190.0, 18.0),
+            d.r(right - 262.0, ry + 7.0, 202.0, 18.0),
             &shown,
             10.5,
             col,
@@ -1336,6 +1659,24 @@ fn card_keys(d: &mut Draw, pc: &Pal, g: &mut Gui, y: f32) -> f32 {
             false,
         );
         record(g, id, rect);
+        let rbid = Id::HkReset(*k);
+        let rb = d.r(right - 47.0, ry + 4.0, 47.0, 22.0);
+        d.round(rb, 7.0, pc.card);
+        d.stroke(
+            rb,
+            7.0,
+            if g.hover == Some(rbid) { pc.accent } else { pc.track },
+            1.0,
+        );
+        d.text(
+            rb,
+            &crate::i18n::ui(d.lang, "重置"),
+            9.5,
+            if g.hover == Some(rbid) { pc.text } else { pc.dim },
+            FMT_CENTER,
+            false,
+        );
+        record(g, rbid, rb);
         ry += 34.0;
         if let Some(n) = &notes[i] {
             d.text(d.r(x0 + 10.0, ry - 3.0, right - x0 - 20.0, 16.0), n, 9.0, 0xE5484D, FMT_LEFT, false);
@@ -1404,27 +1745,62 @@ fn card_keys(d: &mut Draw, pc: &Pal, g: &mut Gui, y: f32) -> f32 {
     y + h + 12.0
 }
 
-fn card_monkeys(d: &mut Draw, pc: &Pal, g: &mut Gui, y: f32) -> f32 {
-    let mons = crate::winapi_util::monitors();
-    if g.mon_open.len() != mons.len() {
-        g.mon_open.resize(mons.len(), false);
+fn card_blocks(d: &mut Draw, pc: &Pal, g: &mut Gui, y: f32, connected: bool) -> f32 {
+    let tag: u8 = if connected { 0 } else { 1 };
+    let idxs: Vec<usize> = (0..g.blocks.len())
+        .filter(|i| !connected || g.blocks[*i].connected)
+        .collect();
+    if idxs.is_empty() {
+        if connected || !g.blocks.is_empty() {
+            return y;
+        }
+        let h = 78.0;
+        card_base(d, pc, y, h);
+        let x0 = PAD + 16.0;
+        d.text(
+            d.r(x0, y + 12.0, 320.0, 18.0),
+            &crate::i18n::ui(d.lang, "连接屏幕管理"),
+            10.0,
+            pc.dim,
+            FMT_LEFT,
+            false,
+        );
+        d.text(
+            d.r(x0, y + 34.0, d.w - 2.0 * PAD - 32.0, 18.0),
+            &crate::i18n::ui(d.lang, "暂无已保存的屏幕配置"),
+            10.0,
+            pc.dim,
+            FMT_LEFT,
+            false,
+        );
+        return y + h + 12.0;
     }
     let all = all_keys(&g.cfg, d.lang);
     let mut h = 44.0;
-    for (i, m) in mons.iter().enumerate() {
+    for &i in idxs.iter() {
         h += 34.0 + 8.0;
-        if !g.mon_open.get(i).copied().unwrap_or(false) {
+            let opened = if connected {
+                g.mon_open.get(i).copied().unwrap_or(false)
+            } else {
+                g.mem_open.get(i).copied().unwrap_or(false)
+            };
+            if !opened {
             continue;
         }
-        let list = g.cfg.mon_entries(&m.device);
+        let dev = g.blocks[i].device.clone();
+        let base = g.blocks[i].label.clone();
+        let list = g.cfg.mon_entries(&dev);
         let mut notes = 0.0;
+        let key_base = g
+            .cfg
+            .mon_names
+            .get(&dev)
+            .cloned()
+            .unwrap_or_else(|| short_dev(&dev));
         for (k, e) in list.iter().enumerate() {
             let act = MON_ACT_LABELS[e.act.min(2) as usize];
-            if conflict_with(&e.spec, &mon_label(d.lang, i, k, act), &all, d.lang).is_some() {
+            if conflict_with(&e.spec, &block_label(&key_base, k, act, d.lang), &all, d.lang).is_some() {
                 notes += 16.0;
-            }
-            if e.act != 2 {
-                notes += 0.0;
             }
         }
         let step_rows = list.iter().filter(|e| e.act != 2).count() as f32 * 30.0;
@@ -1434,34 +1810,41 @@ fn card_monkeys(d: &mut Draw, pc: &Pal, g: &mut Gui, y: f32) -> f32 {
     card_base(d, pc, y, h);
     let x0 = PAD + 16.0;
     let right = d.w - PAD - 16.0;
+    let title = if connected {
+        crate::i18n::ui(d.lang, "每屏独立快捷键")
+    } else {
+        crate::i18n::ui(d.lang, "连接屏幕管理")
+    };
     d.text(
-        d.r(x0, y + 12.0, 300.0, 18.0),
-        &crate::i18n::ui(d.lang, "每屏独立快捷键"),
+        d.r(x0, y + 12.0, 320.0, 18.0),
+        &title,
         10.0,
         pc.dim,
         FMT_LEFT,
         false,
     );
     let mut ry = y + 32.0;
-    if mons.is_empty() {
-        d.text(
-            d.r(x0, ry + 6.0, right - x0, 18.0),
-            &crate::i18n::tr(d.lang, "未检测到显示器"),
-            10.0,
-            pc.dim,
-            FMT_LEFT,
-            false,
-        );
-        return y + h + 12.0;
-    }
-    for (i, m) in mons.iter().enumerate() {
-        let open = g.mon_open.get(i).copied().unwrap_or(false);
-        let list = g.cfg.mon_entries(&m.device);
+    for &i in idxs.iter() {
+        let open = if connected {
+            g.mon_open.get(i).copied().unwrap_or(false)
+        } else {
+            g.mem_open.get(i).copied().unwrap_or(false)
+        };
+        let dev = g.blocks[i].device.clone();
+        let label = g.blocks[i].label.clone();
+        let sub = g.blocks[i].sub.clone();
+        let list = g.cfg.mon_entries(&dev);
         let mut notes = 0.0;
         let mut steps_h = 0.0;
+        let key_base = g
+            .cfg
+            .mon_names
+            .get(&dev)
+            .cloned()
+            .unwrap_or_else(|| short_dev(&dev));
         for (k, e) in list.iter().enumerate() {
             let act = MON_ACT_LABELS[e.act.min(2) as usize];
-            if conflict_with(&e.spec, &mon_label(d.lang, i, k, act), &all, d.lang).is_some() {
+            if conflict_with(&e.spec, &block_label(&key_base, k, act, d.lang), &all, d.lang).is_some() {
                 notes += 16.0;
             }
             if e.act != 2 {
@@ -1475,31 +1858,31 @@ fn card_monkeys(d: &mut Draw, pc: &Pal, g: &mut Gui, y: f32) -> f32 {
                 0.0
             };
         let container = d.r(x0, ry, right - x0, box_h);
-        let hid = Id::MonHead(i);
+        let hid = Id::MonHead(i, tag);
         d.round(container, 10.0, pc.card);
         if g.hover == Some(hid) {
             d.stroke(container, 10.0, pc.stroke, 1.3);
         } else {
             d.stroke(container, 10.0, pc.track, 1.0);
         }
-        let label = mon_name(d.lang, i);
-        let name = if m.friendly.is_empty() {
-            label
+        let sub_w = if sub.is_empty() {
+            0.0
         } else {
-            format!("{}  {}", label, m.friendly)
+            (d.text_w(&sub, 9.5, false) as f32 / d.s).max(60.0) + 4.0
         };
-        let res = format!("{}×{}", m.width(), m.height());
+        if !sub.is_empty() {
+            d.text(
+                d.r(right - 58.0 - sub_w, ry + 8.0, sub_w, 18.0),
+                &sub,
+                9.5,
+                pc.dim,
+                FMT_RIGHT,
+                false,
+            );
+        }
         d.text(
-            d.r(right - 116.0, ry + 8.0, 82.0, 18.0),
-            &res,
-            9.5,
-            pc.dim,
-            FMT_RIGHT,
-            false,
-        );
-        d.text(
-            d.r(x0 + 12.0, ry + 8.0, right - x0 - 168.0, 18.0),
-            &name,
+            d.r(x0 + 12.0, ry + 8.0, right - x0 - 70.0 - sub_w, 18.0),
+            &label,
             10.5,
             pc.text,
             FMT_LEFT,
@@ -1507,6 +1890,15 @@ fn card_monkeys(d: &mut Draw, pc: &Pal, g: &mut Gui, y: f32) -> f32 {
         );
         d.plus_minus(right - 21.0, ry + 17.0, 4.6, !open, pc.dim);
         record(g, hid, d.r(x0, ry, right - x0, 34.0));
+        if !connected {
+            let did = Id::MemDel(i, tag);
+            let dr = d.r(right - 54.0, ry + 6.0, 22.0, 22.0);
+            if g.hover == Some(did) {
+                d.round(dr, 6.0, pc.track);
+            }
+            d.text(dr, "×", 12.0, pc.dim, FMT_CENTER, false);
+            record(g, did, dr);
+        }
         if !open {
             ry += 34.0 + 8.0;
             continue;
@@ -1514,10 +1906,10 @@ fn card_monkeys(d: &mut Draw, pc: &Pal, g: &mut Gui, y: f32) -> f32 {
         let mut iy = ry + 34.0 + 6.0;
         for (k, e) in list.iter().enumerate() {
             let act = MON_ACT_LABELS[e.act.min(2) as usize];
-            let note = conflict_with(&e.spec, &mon_label(d.lang, i, k, act), &all, d.lang);
+            let note = conflict_with(&e.spec, &block_label(&key_base, k, act, d.lang), &all, d.lang);
             let act_rect = d.r(x0 + 12.0, iy, 70.0, 28.0);
-            let aid = Id::MonAct(i, k);
-            let menu_open = g.mon_menu == Some((i, k));
+            let aid = Id::MonAct(i, k, tag);
+            let menu_open = g.mon_menu == Some((i, k, tag));
             d.round(act_rect, 7.0, if menu_open { pc.accent } else { pc.track });
             d.text(
                 act_rect,
@@ -1537,13 +1929,13 @@ fn card_monkeys(d: &mut Draw, pc: &Pal, g: &mut Gui, y: f32) -> f32 {
                 pc,
                 g,
                 spec_rect,
-                Id::MonKey(i, k),
+                Id::MonKey(i, k, tag),
                 &e.spec,
-                g.mon_capture == Some((i, k)),
+                g.mon_capture == Some((i, k, tag)),
                 note.is_some(),
             );
             let del = d.r(right - 32.0, iy, 24.0, 28.0);
-            let did = Id::MonDel(i, k);
+            let did = Id::MonDel(i, k, tag);
             if g.hover == Some(did) {
                 d.round(del, 7.0, pc.track);
             }
@@ -1554,7 +1946,7 @@ fn card_monkeys(d: &mut Draw, pc: &Pal, g: &mut Gui, y: f32) -> f32 {
                 let chips = [1.0f32, 2.0, 5.0, 10.0];
                 for (si, v) in chips.iter().enumerate() {
                     let cr = d.r(x0 + 88.0 + si as f32 * 52.0, iy, 46.0, 24.0);
-                    let sid = Id::MonStep(i, k, si);
+                    let sid = Id::MonStep(i, k, si, tag);
                     let on = (e.step - v).abs() < 0.01;
                     d.round(cr, 6.0, if on { pc.accent } else { pc.track });
                     let t = format!("±{}%", *v as i32);
@@ -1568,7 +1960,7 @@ fn card_monkeys(d: &mut Draw, pc: &Pal, g: &mut Gui, y: f32) -> f32 {
                     );
                     record(g, sid, cr);
                 }
-                let sed = Id::MonStepIn(i, k);
+                let sed = Id::MonStepIn(i, k, tag);
                 let sed_on = g.mon_step_edit == Some((i, k));
                 let inr = d.r(right - 74.0, iy, 46.0, 24.0);
                 d.round(inr, 6.0, pc.track);
@@ -1606,12 +1998,19 @@ fn card_monkeys(d: &mut Draw, pc: &Pal, g: &mut Gui, y: f32) -> f32 {
                 iy += 30.0;
             }
             if let Some(n) = &note {
-                d.text(d.r(x0 + 88.0, iy - 5.0, right - x0 - 96.0, 16.0), n, 9.0, 0xE5484D, FMT_LEFT, false);
+                d.text(
+                    d.r(x0 + 88.0, iy - 5.0, right - x0 - 96.0, 16.0),
+                    n,
+                    9.0,
+                    0xE5484D,
+                    FMT_LEFT,
+                    false,
+                );
                 iy += 16.0;
             }
         }
         let add = d.r(x0 + 12.0, iy, right - x0 - 24.0, 28.0);
-        let adid = Id::MonAdd(i);
+        let adid = Id::MonAdd(i, tag);
         d.round(add, 7.0, pc.card);
         d.stroke(add, 7.0, if g.hover == Some(adid) { pc.accent } else { pc.track }, 1.0);
         d.text(
@@ -1628,8 +2027,17 @@ fn card_monkeys(d: &mut Draw, pc: &Pal, g: &mut Gui, y: f32) -> f32 {
     y + h + 12.0
 }
 
+fn card_monkeys(d: &mut Draw, pc: &Pal, g: &mut Gui, y: f32) -> f32 {
+    card_blocks(d, pc, g, y, true)
+}
+
+fn card_remembered(d: &mut Draw, pc: &Pal, g: &mut Gui, y: f32) -> f32 {
+    card_blocks(d, pc, g, y, false)
+}
+
+
 fn mon_menu_popup(d: &mut Draw, pc: &Pal, g: &mut Gui) {
-    let (mi, mk) = match g.mon_menu {
+    let (mi, mk, tag) = match g.mon_menu {
         Some(v) => v,
         None => return,
     };
@@ -1652,15 +2060,15 @@ fn mon_menu_popup(d: &mut Draw, pc: &Pal, g: &mut Gui) {
             right: rect.right,
             bottom: rect.top + d.px(4.0 + (m as f32 + 1.0) * ch),
         };
-        let id = Id::MonActItem(mi, mk, m);
+        let id = Id::MonActItem(mi, mk, m, tag);
         if g.hover == Some(id) {
             d.round(cell, 6.0, pc.track);
         }
-        let cur = crate::winapi_util::monitors()
-            .get(mi)
-            .map(|mm| {
+        let cur = g
+            .dev_of(mi)
+            .map(|dev| {
                 g.cfg
-                    .mon_entries(&mm.device)
+                    .mon_entries(&dev)
                     .get(mk)
                     .map(|e| e.act)
                     .unwrap_or(0)
@@ -1836,31 +2244,55 @@ impl Gui {
                 self.repaint();
             }
             Id::HkChip(k) => {
+                self.key_sel = None;
+                self.mon_capture = None;
                 self.capture = Some(k);
+                self.held = 0;
+                start_capture(self.hwnd);
+                self.repaint();
+            }
+            Id::HkReset(k) => {
+                let d = HK_DEFAULTS[k as usize % 4];
+                stop_capture();
+                self.key_sel = None;
+                self.capture = None;
+                self.held = 0;
+                match k {
+                    0 => self.cfg.hk_inc = d.to_string(),
+                    1 => self.cfg.hk_dec = d.to_string(),
+                    2 => self.cfg.hk_off = d.to_string(),
+                    _ => self.cfg.hk_toggle = d.to_string(),
+                }
+                self.core.update(|c| match k {
+                    0 => c.hk_inc = d.to_string(),
+                    1 => c.hk_dec = d.to_string(),
+                    2 => c.hk_off = d.to_string(),
+                    _ => c.hk_toggle = d.to_string(),
+                });
                 self.repaint();
             }
             Id::Osd(i) => {
                 let mode = [OsdMode::Force, OsdMode::Compat, OsdMode::Off][i];
                 self.push(|c| c.osd = mode);
             }
-            Id::MonHead(i) => {
-                if i < self.mon_open.len() {
-                    self.mon_open[i] = !self.mon_open[i];
+            Id::MonHead(i, tag) => {
+                let opens = if tag == 0 { &mut self.mon_open } else { &mut self.mem_open };
+                if i < opens.len() {
+                    opens[i] = !opens[i];
                 }
                 self.mon_menu = None;
                 self.repaint();
             }
-            Id::MonAct(i, k) => {
-                self.mon_menu = if self.mon_menu == Some((i, k)) {
+            Id::MonAct(i, k, tag) => {
+                self.mon_menu = if self.mon_menu == Some((i, k, tag)) {
                     None
                 } else {
-                    Some((i, k))
+                    Some((i, k, tag))
                 };
                 self.repaint();
             }
-            Id::MonActItem(i, k, m) => {
-                if let Some(mm) = crate::winapi_util::monitors().get(i) {
-                    let dev = mm.device.clone();
+            Id::MonActItem(i, k, m, _) => {
+                if let Some(dev) = self.dev_of(i) {
                     let mut list = self.cfg.mon_entries(&dev);
                     if let Some(e) = list.get_mut(k) {
                         e.act = m;
@@ -1872,9 +2304,10 @@ impl Gui {
                 self.mon_menu = None;
                 self.repaint();
             }
-            Id::MonDel(i, k) => {
-                if let Some(mm) = crate::winapi_util::monitors().get(i) {
-                    let dev = mm.device.clone();
+            Id::MonDel(i, k, _) => {
+                stop_capture();
+                self.key_sel = None;
+                if let Some(dev) = self.dev_of(i) {
                     let mut list = self.cfg.mon_entries(&dev);
                     if k < list.len() {
                         list.remove(k);
@@ -1887,9 +2320,9 @@ impl Gui {
                 self.mon_capture = None;
                 self.repaint();
             }
-            Id::MonAdd(i) => {
-                if let Some(mm) = crate::winapi_util::monitors().get(i) {
-                    let dev = mm.device.clone();
+            Id::MonAdd(i, tag) => {
+                stop_capture();
+                if let Some(dev) = self.dev_of(i) {
                     let mut list = self.cfg.mon_entries(&dev);
                     list.push(MonKey {
                         act: 0,
@@ -1900,21 +2333,58 @@ impl Gui {
                     self.cfg.set_mon_entries(&dev, list.clone());
                     let dev2 = dev.clone();
                     self.core.update(move |c| c.set_mon_entries(&dev2, list));
-                    self.mon_capture = Some((i, idx));
+                    self.key_sel = Some(Id::MonKey(i, idx, tag));
+                    self.mon_capture = None;
+                    self.capture = None;
                 }
                 self.mon_menu = None;
                 self.repaint();
             }
-            Id::MonKey(i, k) => {
-                self.mon_capture = Some((i, k));
+            Id::MemDel(i, _) => {
+                stop_capture();
+                self.key_sel = None;
+                let connected = self.blocks.get(i).map(|b| b.connected).unwrap_or(false);
+                if let Some(dev) = self.dev_of(i) {
+                    self.cfg.set_mon_entries(&dev, Vec::new());
+                    if !connected {
+                        self.cfg.mon_names.remove(&dev);
+                        self.cfg.mon_meta.remove(&dev);
+                    }
+                    let dev2 = dev.clone();
+                    self.core.update(move |c| {
+                        c.set_mon_entries(&dev2, Vec::new());
+                        if !connected {
+                            c.mon_names.remove(&dev2);
+                            c.mon_meta.remove(&dev2);
+                        }
+                    });
+                    if !connected && i < self.mon_open.len() {
+                        self.mon_open.remove(i);
+                    }
+                    if !connected && i < self.mem_open.len() {
+                        self.mem_open.remove(i);
+                    }
+                    self.mon_menu = None;
+                    self.mon_capture = None;
+                    self.capture = None;
+                    self.mon_step_edit = None;
+                    self.rebuild_blocks();
+                    self.repaint();
+                }
+            }
+            Id::MonKey(i, k, tag) => {
+                self.key_sel = None;
+                self.capture = None;
+                self.mon_capture = Some((i, k, tag));
+                self.held = 0;
+                start_capture(self.hwnd);
                 self.mon_menu = None;
                 self.repaint();
             }
-            Id::MonStep(i, k, si) => {
+            Id::MonStep(i, k, si, _) => {
                 self.mon_step_edit = None;
                 self.mon_step_text.clear();
-                if let Some(mm) = crate::winapi_util::monitors().get(i) {
-                    let dev = mm.device.clone();
+                if let Some(dev) = self.dev_of(i) {
                     let mut list = self.cfg.mon_entries(&dev);
                     if let Some(e) = list.get_mut(k) {
                         e.step = [1.0f32, 2.0, 5.0, 10.0][si.min(3)];
@@ -2131,6 +2601,45 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
     unsafe {
         match msg {
             WM_CREATE => LRESULT(0),
+            WM_CAPTURED => {
+                if let Some(g) = gui_of(hwnd) {
+                    let vk = CAP_VK.swap(0, Ordering::SeqCst);
+                    let mods = CAP_MODS.swap(0, Ordering::SeqCst);
+                    let spec = if vk != 0 { Some(crate::hotkey::format(mods, vk)) } else { None };
+                    stop_capture();
+                    if let Some(spec) = spec {
+                        if let Some((mi, ei, _)) = g.mon_capture {
+                            if let Some(dev) = g.dev_of(mi) {
+                                let mut list = g.cfg.mon_entries(&dev);
+                                if let Some(e) = list.get_mut(ei) {
+                                    e.spec = spec;
+                                }
+                                g.cfg.set_mon_entries(&dev, list.clone());
+                                let dev2 = dev.clone();
+                                g.core.update(move |c| c.set_mon_entries(&dev2, list));
+                            }
+                        } else if let Some(k) = g.capture {
+                            match k {
+                                0 => g.cfg.hk_inc = spec.clone(),
+                                1 => g.cfg.hk_dec = spec.clone(),
+                                2 => g.cfg.hk_off = spec.clone(),
+                                _ => g.cfg.hk_toggle = spec.clone(),
+                            }
+                            g.core.update(|c| match k {
+                                0 => c.hk_inc = spec.clone(),
+                                1 => c.hk_dec = spec.clone(),
+                                2 => c.hk_off = spec.clone(),
+                                _ => c.hk_toggle = spec.clone(),
+                            });
+                        }
+                    }
+                    g.mon_capture = None;
+                    g.capture = None;
+                    g.held = 0;
+                    g.repaint();
+                }
+                LRESULT(0)
+            }
             WM_PAINT => {
                 let Some(g) = gui_of(hwnd) else {
                     return DefWindowProcW(hwnd, msg, wparam, lparam);
@@ -2216,6 +2725,12 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                     if g.tick % 10 == 0 {
                         refresh_monitors(g);
                     }
+                    if g.tick % 5 == 0 && matches!(g.cfg.theme, ThemeMode::System) {
+                        if crate::winapi_util::system_prefers_dark() != g.dark {
+                            g.apply_theme();
+                            g.repaint();
+                        }
+                    }
                     let (_, rev) = g.core.snapshot();
                     if rev != g.rev {
                         let (cfg, rev) = g.core.snapshot();
@@ -2240,6 +2755,13 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                             }
                         }
                     }
+                }
+                LRESULT(0)
+            }
+            0x001A => {
+                if let Some(g) = gui_of(hwnd) {
+                    g.apply_theme();
+                    g.repaint();
                 }
                 LRESULT(0)
             }
@@ -2298,7 +2820,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                         g.commit_input();
                     }
                     let same_mon = match id {
-                        Some(Id::MonStepIn(i, k)) => g.mon_step_edit == Some((i, k)),
+                        Some(Id::MonStepIn(i, k, _)) => g.mon_step_edit == Some((i, k)),
                         _ => false,
                     };
                     if g.mon_step_edit.is_some() && !same_mon {
@@ -2307,8 +2829,18 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                     if g.lang_open && !matches!(id, Some(Id::Lang) | Some(Id::LangItem(_))) {
                         g.lang_open = false;
                     }
+                    if (g.capture.is_some() || g.mon_capture.is_some())
+                        && !matches!(id, Some(Id::HkChip(_)) | Some(Id::MonKey(_, _, _)))
+                    {
+                        stop_capture();
+                        g.capture = None;
+                        g.mon_capture = None;
+                        g.key_sel = None;
+                        g.held = 0;
+                        g.repaint();
+                    }
                     if g.mon_menu.is_some()
-                        && !matches!(id, Some(Id::MonAct(_, _)) | Some(Id::MonActItem(_, _, _)))
+                        && !matches!(id, Some(Id::MonAct(_, _, _)) | Some(Id::MonActItem(_, _, _, _)))
                     {
                         g.mon_menu = None;
                         g.repaint();
@@ -2332,12 +2864,12 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                             g.select_all = true;
                             g.num = format!("{}", g.level().round() as i32);
                         }
-                        Some(Id::MonStepIn(i, k)) => {
+                        Some(Id::MonStepIn(i, k, _)) => {
                             g.editing = false;
                             g.mon_step_edit = Some((i, k));
                             let mut text = String::new();
-                            if let Some(mm) = crate::winapi_util::monitors().get(i) {
-                                if let Some(e) = g.cfg.mon_entries(&mm.device).get(k) {
+                            if let Some(dev) = g.dev_of(i) {
+if let Some(e) = g.cfg.mon_entries(&dev).get(k) {
                                     text = fmt_step(e.step);
                                 }
                             }
@@ -2455,37 +2987,30 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                 }
                 LRESULT(0)
             }
-            WM_KEYDOWN => {
+            WM_KEYDOWN | WM_SYSKEYDOWN => {
                 if let Some(g) = gui_of(hwnd) {
                     let vk = wparam.0 as u16;
-                    if let Some((mi, ei)) = g.mon_capture {
-                        use windows::Win32::UI::Input::KeyboardAndMouse::GetKeyState;
-                        let down = |v: u16| unsafe { GetKeyState(v as i32) as u16 & 0x8000 != 0 };
+                    let sys = msg == WM_SYSKEYDOWN;
+                    let real_key = vk >= 0x08 && vk <= 0xFE && vk != 0xE7;
+                    match vk {
+                        0x10 => g.held |= crate::hotkey::M_SHIFT,
+                        0x11 => g.held |= crate::hotkey::M_CTRL,
+                        0x12 => g.held |= crate::hotkey::M_ALT,
+                        0x5B | 0x5C => g.held |= crate::hotkey::M_WIN,
+                        _ => {}
+                    }
+                    if let Some((mi, ei, _)) = g.mon_capture {
+                        use windows::Win32::UI::Input::KeyboardAndMouse::GetAsyncKeyState;
+                        let down = |v: u16| unsafe { GetAsyncKeyState(v as i32) as u16 & 0x8000 != 0 };
                         if vk == VK_ESCAPE.0 {
                             g.mon_capture = None;
+                            g.held = 0;
                             g.repaint();
                             return LRESULT(0);
                         }
-                        if [0x10u16, 0x11, 0x12, 0x5B, 0x5C].contains(&vk) {
-                            return LRESULT(0);
-                        }
-                        let mut mods = 0u32;
-                        if down(0x11) {
-                            mods |= crate::hotkey::M_CTRL;
-                        }
-                        if down(0x12) {
-                            mods |= crate::hotkey::M_ALT;
-                        }
-                        if down(0x10) {
-                            mods |= crate::hotkey::M_SHIFT;
-                        }
-                        if down(0x5B) || down(0x5C) {
-                            mods |= crate::hotkey::M_WIN;
-                        }
-                        if mods != 0 {
-                            let spec = crate::hotkey::format(mods, vk as u32);
-                            if let Some(mm) = crate::winapi_util::monitors().get(mi) {
-                                let dev = mm.device.clone();
+                        let alt_bit = (lparam.0 >> 29) & 1 == 1;
+                        if let Some(spec) = captured_spec(g.held, alt_bit, sys, vk, &down) {
+                            if let Some(dev) = g.dev_of(mi) {
                                 let mut list = g.cfg.mon_entries(&dev);
                                 if let Some(e) = list.get_mut(ei) {
                                     e.spec = spec;
@@ -2495,37 +3020,24 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                                 g.core.update(move |c| c.set_mon_entries(&dev2, list));
                             }
                             g.mon_capture = None;
+                            g.held = 0;
                             g.repaint();
                         }
                         return LRESULT(0);
                     }
                     if let Some(k) = g.capture {
-                        use windows::Win32::UI::Input::KeyboardAndMouse::GetKeyState;
-                        let down = |v: u16| unsafe { GetKeyState(v as i32) as u16 & 0x8000 != 0 };
+                        use windows::Win32::UI::Input::KeyboardAndMouse::GetAsyncKeyState;
+                        let down = |v: u16| unsafe { GetAsyncKeyState(v as i32) as u16 & 0x8000 != 0 };
                         if vk == VK_ESCAPE.0 {
                             g.capture = None;
+                            g.held = 0;
                             g.repaint();
                             return LRESULT(0);
                         }
-                        if [0x10u16, 0x11, 0x12, 0x5B, 0x5C].contains(&vk) {
-                            return LRESULT(0);
-                        }
-                        let mut mods = 0u32;
-                        if down(0x11) {
-                            mods |= crate::hotkey::M_CTRL;
-                        }
-                        if down(0x12) {
-                            mods |= crate::hotkey::M_ALT;
-                        }
-                        if down(0x10) {
-                            mods |= crate::hotkey::M_SHIFT;
-                        }
-                        if down(0x5B) || down(0x5C) {
-                            mods |= crate::hotkey::M_WIN;
-                        }
-                        if mods != 0 {
-                            let spec = crate::hotkey::format(mods, vk as u32);
+                        let alt_bit = (lparam.0 >> 29) & 1 == 1;
+                        if let Some(spec) = captured_spec(g.held, alt_bit, sys, vk, &down) {
                             g.capture = None;
+                            g.held = 0;
                             match k {
                                 0 => g.cfg.hk_inc = spec.clone(),
                                 1 => g.cfg.hk_dec = spec.clone(),
@@ -2590,11 +3102,26 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                         g.edit_kind = 0;
                         g.repaint();
                     }
+                    if sys && !g.editing {
+                        return DefWindowProcW(hwnd, msg, wparam, lparam);
+                    }
                 }
                 LRESULT(0)
             }
             0x0317 | 0x0318 => LRESULT(0),
-            WM_SYSKEYDOWN => DefWindowProcW(hwnd, msg, wparam, lparam),
+            WM_KEYUP | WM_SYSKEYUP => {
+                if let Some(g) = gui_of(hwnd) {
+                    let vk = wparam.0 as u16;
+                    match vk {
+                        0x10 => g.held &= !crate::hotkey::M_SHIFT,
+                        0x11 => g.held &= !crate::hotkey::M_CTRL,
+                        0x12 => g.held &= !crate::hotkey::M_ALT,
+                        0x5B | 0x5C => g.held &= !crate::hotkey::M_WIN,
+                        _ => {}
+                    }
+                }
+                DefWindowProcW(hwnd, msg, wparam, lparam)
+            }
             WM_SIZE => {
                 if let Some(g) = gui_of(hwnd) {
                     let mut rc = RECT::default();
@@ -2657,5 +3184,3 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
         }
     }
 }
-
-

@@ -1221,6 +1221,57 @@ const MON_ROWS: [[&str; 6]; 20] = [
     ["प्रति डिस्प्ले शॉर्टकट", "गहरा", "उजला", "बंद", "शॉर्टकट जोड़ें", "शॉर्टकट टकराव"],
 ];
 
+const MEM_KEYS: [&str; 2] = ["连接屏幕管理", "暂无已保存的屏幕配置"];
+
+const MEM_ROWS: [[&str; 2]; 20] = [
+    ["连接屏幕管理", "暂无已保存的屏幕配置"],
+    ["連接螢幕管理", "尚無已儲存的螢幕設定"],
+    ["Connected displays", "No saved display settings yet"],
+    ["Connected displays", "No saved display settings yet"],
+    ["接続ディスプレイ管理", "保存された設定はまだありません"],
+    ["연결된 디스플레이 관리", "저장된 설정이 없습니다"],
+    ["Écrans connectés", "Aucun réglage enregistré"],
+    ["Verbundene Bildschirme", "Noch keine gespeicherten Einstellungen"],
+    ["Pantallas conectadas", "Aún no hay ajustes guardados"],
+    ["Schermi connessi", "Nessuna impostazione salvata"],
+    ["Подключённые экраны", "Сохранённых настроек пока нет"],
+    ["Monitores conectados", "Nenhuma configuração salva"],
+    ["Podłączone ekrany", "Brak zapisanych ustawień"],
+    ["Verbonden schermen", "Nog geen opgeslagen instellingen"],
+    ["Bağlı ekranlar", "Henüz kayıtlı ayar yok"],
+    ["Підключені екрани", "Збережених налаштувань ще немає"],
+    ["Màn hình đã kết nối", "Chưa có cấu hình nào được lưu"],
+    ["Layar terhubung", "Belum ada pengaturan tersimpan"],
+    ["หน้าจอที่เชื่อมต่อ", "ยังไม่มีการตั้งค่าที่บันทึกไว้"],
+    ["कनेक्टेड डिस्प्ले", "अभी कोई सहेजी गई सेटिंग नहीं"],
+];
+
+
+const RST_KEYS: [&str; 1] = ["重置"];
+
+const RST_ROWS: [[&str; 1]; 20] = [
+    ["重置"],
+    ["重設"],
+    ["Reset"],
+    ["Reset"],
+    ["リセット"],
+    ["초기화"],
+    ["Réinitialiser"],
+    ["Zurücksetzen"],
+    ["Restablecer"],
+    ["Ripristina"],
+    ["Сбросить"],
+    ["Redefinir"],
+    ["Resetuj"],
+    ["Resetten"],
+    ["Sıfırla"],
+    ["Скинути"],
+    ["Đặt lại"],
+    ["Atur ulang"],
+    ["รีเซ็ต"],
+    ["रीसेट"],
+];
+
 pub fn ui(lang: Lang, key: &str) -> String {
     if lang == Lang::ZhHans {
         return key.to_string();
@@ -1230,6 +1281,12 @@ pub fn ui(lang: Lang, key: &str) -> String {
     }
     if let Some(i) = MON_KEYS.iter().position(|k| *k == key) {
         return MON_ROWS[lang.idx() as usize][i].to_string();
+    }
+    if let Some(i) = MEM_KEYS.iter().position(|k| *k == key) {
+        return MEM_ROWS[lang.idx() as usize][i].to_string();
+    }
+    if let Some(i) = RST_KEYS.iter().position(|k| *k == key) {
+        return RST_ROWS[lang.idx() as usize][i].to_string();
     }
     tr(lang, key)
 }

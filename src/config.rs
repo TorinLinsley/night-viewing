@@ -78,6 +78,8 @@ pub struct Config {
     pub osd: OsdMode,
     pub levels: HashMap<String, f32>,
     pub mon_hk: HashMap<String, Vec<MonKey>>,
+    pub mon_names: HashMap<String, String>,
+    pub mon_meta: HashMap<String, String>,
 }
 
 impl Default for Config {
@@ -103,6 +105,8 @@ impl Default for Config {
             osd: OsdMode::Force,
             levels: HashMap::new(),
             mon_hk: HashMap::new(),
+            mon_names: HashMap::new(),
+            mon_meta: HashMap::new(),
         }
     }
 }
@@ -157,6 +161,15 @@ impl Config {
         }
         if !cfg.restore_opacity {
             cfg.opacity = Self::default().opacity;
+        }
+        cfg.hk_inc = crate::hotkey::normalize(&cfg.hk_inc);
+        cfg.hk_dec = crate::hotkey::normalize(&cfg.hk_dec);
+        cfg.hk_off = crate::hotkey::normalize(&cfg.hk_off);
+        cfg.hk_toggle = crate::hotkey::normalize(&cfg.hk_toggle);
+        for list in cfg.mon_hk.values_mut() {
+            for e in list.iter_mut() {
+                e.spec = crate::hotkey::normalize(&e.spec);
+            }
         }
         cfg
     }

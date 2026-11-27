@@ -57,6 +57,7 @@ pub fn init(core: &Arc<Core>, dark: bool) {
     DARK.store(dark, Ordering::Relaxed);
     std::thread::Builder::new()
         .name("night-viewing-hint".into())
+        .stack_size(256 * 1024)
         .spawn(run)
         .ok();
 }
@@ -97,6 +98,22 @@ pub fn toggle_panel() {
 
 pub fn hide_panel() {
     post(&PANEL_WND, WM_PANEL_HIDE);
+}
+
+pub fn anchor() -> Option<HWND> {
+    for slot in [&PANEL_WND, &HINT_WND] {
+        let h = slot.load(Ordering::Relaxed);
+        if h == 0 {
+            continue;
+        }
+        let hwnd = HWND(h as *mut _);
+        unsafe {
+            if IsWindowVisible(hwnd).as_bool() {
+                return Some(hwnd);
+            }
+        }
+    }
+    None
 }
 
 pub fn raise() {
@@ -343,6 +360,7 @@ struct State {
     dark: bool,
     click_prev: bool,
     rgn: (i32, i32),
+    mon_check: Instant,
 }
 
 unsafe fn monitor_icon(p: &mut Paint, x: f32, y: f32, size: f32, color: u32) {
@@ -390,8 +408,13 @@ unsafe fn paint(hwnd: HWND, st: &mut State) {
             (i18n::ui(cfg.lang, "全部显示器"), None, cfg.opacity, true)
         } else {
             let m = &st.monitors[i - 1];
+            let name = if m.friendly.is_empty() {
+                i18n::tr(cfg.lang, &format!("显示器 {i}"))
+            } else {
+                m.friendly.clone()
+            };
             (
-                i18n::tr(cfg.lang, &format!("显示器 {i}")),
+                name,
                 Some(m.device.clone()),
                 cfg.level_for(&m.device),
                 cfg.display_on(&m.device),
@@ -399,17 +422,17 @@ unsafe fn paint(hwnd: HWND, st: &mut State) {
         };
 
         monitor_icon(&mut p, LM_PAD + 2.0, cy - 7.5, 15.0, if enabled { sty.dim } else { sty.track });
-        let lab = p.r(LM_PAD + 26.0, top, 88.0, row_h);
+        let track_x = LM_PAD + 150.0;
+        let lab = p.r(LM_PAD + 26.0, top, track_x - LM_PAD - 34.0, row_h);
         p.text(
             lab,
             &label,
             11.5,
             if enabled { sty.text } else { sty.dim },
-            FMT_LEFT,
+            FMT_LEFT | 0x8000,
             i == 0,
         );
 
-        let track_x = LM_PAD + 118.0;
         let track_w = lw - track_x - LM_PAD - 48.0;
         let track = p.r(track_x, cy - 2.0, track_w, 4.0);
         p.round(track, 2.0, sty.track);
@@ -579,6 +602,24 @@ unsafe extern "system" fn osd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam:
                 LRESULT(0)
             }
             WM_TIMER => {
+                if st.mon_check.elapsed() >= std::time::Duration::from_millis(500) {
+                    st.mon_check = Instant::now();
+                    let ms = winapi_util::monitors();
+                    let same = ms.len() == st.monitors.len()
+                        && ms
+                            .iter()
+                            .zip(st.monitors.iter())
+                            .all(|(a, b)| a.device == b.device);
+                    if !same {
+                        st.monitors = ms;
+                        if st.drag.map(|i| i > st.monitors.len()).unwrap_or(false) {
+                            st.drag = None;
+                        }
+                        layout(hwnd, st);
+                        let _ = InvalidateRect(Some(hwnd), None, false);
+                        let _ = UpdateWindow(hwnd);
+                    }
+                }
                 if IsWindowVisible(hwnd).as_bool() {
                     let down = (GetAsyncKeyState(0x01) as u16 & 0x8000) != 0
                         || (GetAsyncKeyState(0x02) as u16 & 0x8000) != 0;
@@ -717,6 +758,7 @@ fn run() {
                 rev: 0,
                 rows: Vec::new(),
                 monitors: winapi_util::monitors(),
+                mon_check: Instant::now(),
                 dark: DARK.load(Ordering::Relaxed),
                 click_prev: false,
                 rgn: (0, 0),

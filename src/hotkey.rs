@@ -135,3 +135,10 @@ pub fn format(mods: u32, vk: u32) -> String {
     out.push_str(&key_name(vk));
     out
 }
+
+pub fn normalize(spec: &str) -> String {
+    match parse(spec) {
+        Some((m, v)) => format(m, v),
+        None => spec.to_string(),
+    }
+}

@@ -66,12 +66,15 @@ pub fn init(core: &Arc<Core>, for_dark: bool, lang: Lang) -> Option<TrayIcon> {
             ..
         } => {
             let ticket = CLICK_GEN.fetch_add(1, Ordering::SeqCst) + 1;
-            std::thread::spawn(move || {
-                std::thread::sleep(Duration::from_millis(260));
-                if CLICK_GEN.load(Ordering::SeqCst) == ticket {
-                    osd::toggle_panel();
-                }
-            });
+            std::thread::Builder::new()
+                .name("night-viewing-tray".into())
+                .stack_size(256 * 1024)
+                .spawn(move || {
+                    std::thread::sleep(Duration::from_millis(260));
+                    if CLICK_GEN.load(Ordering::SeqCst) == ticket {
+                        osd::toggle_panel();
+                    }
+                });
         }
         TrayIconEvent::DoubleClick {
             button: MouseButton::Left,

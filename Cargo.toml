@@ -2,7 +2,7 @@
 authors = ["Torin Linsley"]
 license = "LGPL-2.1"
 name = "night_viewing"
-version = "0.0.1"
+version = "0.0.2"
 edition = "2024"
 description = "Night Viewing - a pure black screen dimming overlay with a modern GUI and tray support"
 
