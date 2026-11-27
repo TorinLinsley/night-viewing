@@ -1037,8 +1037,12 @@ fn header(d: &mut Draw, pc: &Pal, g: &mut Gui, y: f32) -> f32 {
         FMT_LEFT,
         false,
     );
-    let pct = (100.0 - g.level() / MAX_LEVEL * 100.0).round() as i32;
-    let label = format!("亮度 ≈ {pct}%");
+    let label = if g.cfg.hide {
+        crate::i18n::ui(d.lang, "遮罩已关闭")
+    } else {
+        let pct = (100.0 - g.level() / MAX_LEVEL * 100.0).round() as i32;
+        format!("亮度 ≈ {pct}%")
+    };
     let tw = d.text_w(&label, 10.4, false);
     let w = (tw as f32 / d.s) + 20.0;
     let r = d.r(d.w - PAD - w, y + 8.0, w, 22.0);
@@ -1420,8 +1424,8 @@ fn card_appearance(d: &mut Draw, pc: &Pal, g: &mut Gui, y: f32) -> f32 {
 const MON_ACT_LABELS: [&str; 3] = ["加深", "减淡", "关闭"];
 
 const HK_DEFAULTS: [&str; 4] = [
-    "Ctrl+Alt+Shift+Up",
     "Ctrl+Alt+Shift+Down",
+    "Ctrl+Alt+Shift+Up",
     "Ctrl+Alt+Shift+0",
     "Ctrl+Alt+Shift+N",
 ];
@@ -2493,7 +2497,7 @@ unsafe fn center_pos(w: i32, h: i32) -> (i32, i32) {
     }
 }
 
-pub fn run(core: Arc<Core>, for_dark: bool, tray: Option<TrayIcon>) {
+pub fn run(core: Arc<Core>, for_dark: bool, tray: Option<TrayIcon>, first_run: bool) {
     unsafe {
         let hinstance = HINSTANCE(GetModuleHandleW(None).map(|m| m.0).unwrap_or_default());
         let class = wide(CLASS);
@@ -2563,7 +2567,11 @@ pub fn run(core: Arc<Core>, for_dark: bool, tray: Option<TrayIcon>) {
         );
 
         SetTimer(Some(hwnd), 1, 100, None);
-        core.hide_window();
+        if first_run {
+            core.show_window();
+        } else {
+            core.hide_window();
+        }
 
         let mut msg = MSG::default();
         while GetMessageW(&mut msg, None, 0, 0).as_bool() {

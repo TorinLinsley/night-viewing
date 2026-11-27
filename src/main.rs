@@ -50,8 +50,9 @@ fn main() {
         let _ = SetCurrentProcessExplicitAppUserModelID(PCWSTR(id.as_ptr()));
     }
 
+    let first_run = !config::Config::path().exists();
     let core = core::Core::new();
-    if !config::Config::path().exists() {
+    if first_run {
         core.snapshot().0.save();
     }
     overlay::spawn(core.clone());
@@ -72,5 +73,5 @@ fn main() {
             winapi_util::trim_memory();
             std::thread::sleep(std::time::Duration::from_secs(10));
         });
-    gui::run(core, for_dark, tray);
+    gui::run(core, for_dark, tray, first_run);
 }

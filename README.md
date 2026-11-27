@@ -33,14 +33,14 @@
 
 ### 快捷键
 
-默认全局快捷键（可在设置中改绑，冲突时自动换备用键位）：
+默认全局快捷键（可开关、可在设置中改绑，冲突时自动换备用键位）：
 
-| 行为           | 快捷键             | 备用                |
+| 行为             | 快捷键                | 备用                  |
 | -------------- | ------------------ | ------------------- |
-| 遮罩加深       | `Ctrl+Alt+Shift+↑` | `Ctrl+Alt+PageUp`   |
-| 遮罩减淡       | `Ctrl+Alt+Shift+↓` | `Ctrl+Alt+PageDown` |
-| 关闭遮罩（0%） | `Ctrl+Alt+Shift+0` | —                   |
-| 显示主界面     | `Ctrl+Alt+Shift+N` | —                   |
+| 遮罩加深（调**低**亮度） | `Ctrl+Alt+Shift+↓` | `Ctrl+Alt+PageUp`   |
+| 遮罩减淡（调**高**亮度） | `Ctrl+Alt+Shift+↑` | `Ctrl+Alt+PageDown` |
+| 关闭遮罩（0%）       | `Ctrl+Alt+Shift+0` | —                   |
+| 显示主界面          | `Ctrl+Alt+Shift+N` | —                   |
 
 - **步长可调**：加深 / 减淡各有独立的 ±1% / ±2% / ±5% / ±10% 预设，也支持输入任意值
 - **长按连发**：按住不放会持续增减（没有用 `MOD_NOREPEAT`）
@@ -94,7 +94,7 @@ cargo build --release
 - **分层窗口**：每块显示器一个 `WS_EX_LAYERED | WS_EX_TRANSPARENT | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE` 的弹出窗口，用 `SetLayeredWindowAttributes` 调 alpha
 - **DPI**：进程启动即 `SetProcessDpiAwarenessContext(PER_MONITOR_AWARE_V2)`，并用 `GetDpiForWindow` 适配 100% ~ 200% 缩放
 - **热键**：`RegisterHotKey` 挂在消息专用窗口上，注册失败自动降级到备用键位，并在日志中记录原因
-- **内存**：常驻托盘时私有工作集约 450 KB，打开主界面约 420 KB（任务管理器「内存」列同口径），进程总工作集约 750 KB ~ 1.2 MB；无 GPU 渲染、无 WebView，release 构建开启 `lto`、`opt-level = "s"`、`panic = "abort"`、`strip`，并每 10 秒 `SetProcessWorkingSetSize` 回收工作集
+- **内存**：常驻托盘时私有工作集约 400 KB，打开主界面约 460 KB（任务管理器「内存」列同口径），进程总工作集约 1 MB ~ 1.2 MB；无 GPU 渲染、无 WebView，release 构建开启 `lto`、`opt-level = "s"`、`panic = "abort"`、`strip`，并每 10 秒 `SetProcessWorkingSetSize` 回收工作集
 
 ## 已知限制
 

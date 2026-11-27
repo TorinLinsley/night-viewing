@@ -104,6 +104,10 @@ impl Core {
         self.update(|c| c.opacity = value.clamp(0.0, MAX_LEVEL));
     }
 
+    pub fn toggle_hide(&self) {
+        self.update(|c| c.hide = !c.hide);
+    }
+
     pub fn nudge_step(&self, dir: f32) {
         self.nudge_level(None, dir);
     }
@@ -122,6 +126,9 @@ impl Core {
         match device {
             None => self.update(|c| {
                 c.opacity = value;
+                if value > 0.0 {
+                    c.hide = false;
+                }
                 for level in c.levels.values_mut() {
                     *level = value;
                 }
@@ -140,6 +147,9 @@ impl Core {
         match device {
             None => self.update(|c| {
                 c.opacity = (c.opacity + dir * step).clamp(0.0, MAX_LEVEL);
+                if c.opacity > 0.0 {
+                    c.hide = false;
+                }
                 for level in c.levels.values_mut() {
                     *level = (*level + dir * step).clamp(0.0, MAX_LEVEL);
                 }

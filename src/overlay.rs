@@ -39,6 +39,7 @@ const HK_TOGGLE: i32 = 4;
 
 static ALPHA: AtomicU8 = AtomicU8::new(0);
 static WANT_VISIBLE: AtomicBool = AtomicBool::new(false);
+static HIDDEN: AtomicBool = AtomicBool::new(false);
 static TOPMOST: AtomicBool = AtomicBool::new(true);
 static PASSTHROUGH: AtomicBool = AtomicBool::new(true);
 static HOTKEYS: AtomicBool = AtomicBool::new(true);
@@ -49,7 +50,6 @@ static SELECTION: Mutex<(bool, Vec<String>)> = Mutex::new((false, Vec::new()));
 static LEVELS: Mutex<Vec<(String, f32)>> = Mutex::new(Vec::new());
 static BRUSH: AtomicUsize = AtomicUsize::new(0);
 static CORE: OnceLock<Arc<Core>> = OnceLock::new();
-static LAST_HOTKEY: AtomicU64 = AtomicU64::new(0);
 static HK_KEYS: [AtomicU64; 4] = [
     AtomicU64::new(0),
     AtomicU64::new(0),
@@ -65,7 +65,8 @@ pub fn apply(cfg: &Config) {
     let pct = cfg.opacity.clamp(0.0, MAX_LEVEL);
     let alpha = (pct * 255.0 / 100.0).round() as u8;
     ALPHA.store(alpha, Ordering::Relaxed);
-    WANT_VISIBLE.store(alpha > 0, Ordering::Relaxed);
+    HIDDEN.store(cfg.hide, Ordering::Relaxed);
+    WANT_VISIBLE.store(!cfg.hide && alpha > 0, Ordering::Relaxed);
     TOPMOST.store(cfg.always_on_top, Ordering::Relaxed);
     PASSTHROUGH.store(cfg.passthrough, Ordering::Relaxed);
     HOTKEYS.store(cfg.hotkeys, Ordering::Relaxed);
@@ -261,6 +262,11 @@ unsafe fn apply_visual() {
             } else {
                 (alpha, want)
             };
+            let (alpha, want) = if HIDDEN.load(Ordering::Relaxed) {
+                (0u8, false)
+            } else {
+                (alpha, want)
+            };
             let _ = SetLayeredWindowAttributes(hwnd, COLORREF(0), alpha, LWA_ALPHA);
             if IsWindowVisible(hwnd).as_bool() != want {
                 let _ = ShowWindow(hwnd, if want { SW_SHOWNOACTIVATE } else { SW_HIDE });
@@ -438,14 +444,8 @@ fn handle_hotkey(raw: i32) {
         return;
     };
     log("hotkey", &format!("msg id={raw}"));
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_millis() as u64)
-        .unwrap_or(0);
-    let last = LAST_HOTKEY.load(Ordering::Relaxed);
     let id = if raw > 4 { ((raw - 11) % 10) + 1 } else { raw };
-    let debounce = matches!(id, HK_TOGGLE | HK_RESET);
-    if !debounce || now.saturating_sub(last) > 500 {
+    {
         match id {
             HK_INC => {
                 core.nudge_step(1.0);
@@ -456,13 +456,11 @@ fn handle_hotkey(raw: i32) {
                 crate::osd::notify_hint();
             }
             HK_RESET => {
-                core.set_level(None, 0.0);
-                crate::osd::notify_hint();
+                core.toggle_hide();
             }
             HK_TOGGLE => core.toggle_window(),
             _ => {}
         }
-        LAST_HOTKEY.store(now, Ordering::Relaxed);
         log(
             "hotkey",
             &format!("id={id} opacity={}", core.snapshot().0.opacity),

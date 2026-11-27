@@ -24,6 +24,15 @@ pub fn key_name(vk: u32) -> String {
         0x2C => "PrintScreen".to_string(),
         v if (0x30..=0x39).contains(&v) => ((b'0' + (v - 0x30) as u8) as char).to_string(),
         v if (0x41..=0x5A).contains(&v) => ((b'A' + (v - 0x41) as u8) as char).to_string(),
+        v if (0x60..=0x69).contains(&v) => format!("Num{}", v - 0x60),
+        v if v == 0x6A => "Num*".to_string(),
+        v if v == 0x6B => "Num+".to_string(),
+        v if v == 0x6D => "Num-".to_string(),
+        v if v == 0x6E => "Num.".to_string(),
+        v if v == 0x6F => "Num/".to_string(),
+        v if v == 0x14 => "CapsLock".to_string(),
+        v if v == 0x90 => "NumLock".to_string(),
+        v if v == 0x91 => "ScrollLock".to_string(),
         v if (0x70..=0x87).contains(&v) => format!("F{}", v - 0x6F),
         v if v == 0xBA => ";".to_string(),
         v if v == 0xBB => "=".to_string(),
@@ -104,6 +113,45 @@ fn vk_from(low: &str) -> Option<u32> {
                 if c.is_ascii_alphabetic() {
                     return Some(0x41 + (c.to_ascii_uppercase() as u32 - 'A' as u32));
                 }
+            }
+            if let Some(hex) = other.strip_prefix("0x") {
+                if let Ok(v) = u32::from_str_radix(hex, 16) {
+                    if (0x08..=0xFE).contains(&v) {
+                        return Some(v);
+                    }
+                }
+            }
+            if let Some(num) = other.strip_prefix("num") {
+                let v = match num {
+                    "0" => Some(0x60u32),
+                    "1" => Some(0x61),
+                    "2" => Some(0x62),
+                    "3" => Some(0x63),
+                    "4" => Some(0x64),
+                    "5" => Some(0x65),
+                    "6" => Some(0x66),
+                    "7" => Some(0x67),
+                    "8" => Some(0x68),
+                    "9" => Some(0x69),
+                    "*" => Some(0x6A),
+                    "+" => Some(0x6B),
+                    "-" => Some(0x6D),
+                    "." => Some(0x6E),
+                    "/" => Some(0x6F),
+                    _ => None,
+                };
+                if v.is_some() {
+                    return v;
+                }
+            }
+            let named = match other {
+                "capslock" => Some(0x14u32),
+                "numlock" => Some(0x90),
+                "scrolllock" => Some(0x91),
+                _ => None,
+            };
+            if named.is_some() {
+                return named;
             }
             if let Some(num) = other.strip_prefix('f') {
                 if let Ok(n) = num.parse::<u32>() {

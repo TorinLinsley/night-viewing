@@ -59,6 +59,7 @@ fn default_step() -> f32 {
 #[serde(default)]
 pub struct Config {
     pub opacity: f32,
+    pub hide: bool,
     pub theme: ThemeMode,
     pub close_to_tray: bool,
     pub passthrough: bool,
@@ -86,6 +87,7 @@ impl Default for Config {
     fn default() -> Self {
         Self {
             opacity: 0.0,
+            hide: false,
             theme: ThemeMode::System,
             close_to_tray: true,
             passthrough: true,
@@ -96,8 +98,8 @@ impl Default for Config {
             displays: Vec::new(),
             explicit_displays: false,
             lang: Lang::default(),
-            hk_inc: "Ctrl+Alt+Shift+↑".into(),
-            hk_dec: "Ctrl+Alt+Shift+↓".into(),
+            hk_inc: "Ctrl+Alt+Shift+↓".into(),
+            hk_dec: "Ctrl+Alt+Shift+↑".into(),
             hk_off: "Ctrl+Alt+Shift+0".into(),
             hk_toggle: "Ctrl+Alt+Shift+N".into(),
             step_up: 5.0,

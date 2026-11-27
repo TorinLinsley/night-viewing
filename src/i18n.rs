@@ -1272,6 +1272,31 @@ const RST_ROWS: [[&str; 1]; 20] = [
     ["रीसेट"],
 ];
 
+const OFF_KEYS: [&str; 2] = ["遮罩已关闭", "关闭 / 开启遮罩"];
+
+const OFF_ROWS: [[&str; 2]; 20] = [
+    ["遮罩已关闭", "关闭 / 开启遮罩"],
+    ["遮罩已關閉", "關閉 / 開啟遮罩"],
+    ["Overlay off", "Turn overlay on or off"],
+    ["Overlay off", "Turn overlay on or off"],
+    ["オーバーレイはオフ", "オーバーレイのオン・オフ"],
+    ["오버레이 꺼짐", "오버레이 켜기·끄기"],
+    ["Voile désactivé", "Activer ou désactiver le voile"],
+    ["Overlay aus", "Overlay ein- oder ausschalten"],
+    ["Capa desactivada", "Activar o desactivar la capa"],
+    ["Velo disattivato", "Attiva o disattiva il velo"],
+    ["Затемнение выключено", "Включить или выключить затемнение"],
+    ["Película desativada", "Ativar ou desativar a película"],
+    ["Nakładka wyłączona", "Włącz lub wyłącz nakładkę"],
+    ["Overlay uit", "Overlay aan of uit"],
+    ["Kaplama kapalı", "Kaplamayı aç veya kapat"],
+    ["Затемнення вимкнено", "Увімкнути або вимкнути затемнення"],
+    ["Lớp phủ đã tắt", "Bật hoặc tắt lớp phủ"],
+    ["Lapisan mati", "Nyalakan atau matikan lapisan"],
+    ["ปิดการหรี่จอแล้ว", "เปิดหรือปิดการหรี่จอ"],
+    ["ओवरले बंद", "ओवरले चालू या बंद करें"],
+];
+
 pub fn ui(lang: Lang, key: &str) -> String {
     if lang == Lang::ZhHans {
         return key.to_string();
@@ -1287,6 +1312,9 @@ pub fn ui(lang: Lang, key: &str) -> String {
     }
     if let Some(i) = RST_KEYS.iter().position(|k| *k == key) {
         return RST_ROWS[lang.idx() as usize][i].to_string();
+    }
+    if let Some(i) = OFF_KEYS.iter().position(|k| *k == key) {
+        return OFF_ROWS[lang.idx() as usize][i].to_string();
     }
     tr(lang, key)
 }

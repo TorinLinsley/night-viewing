@@ -24,7 +24,7 @@ pub fn init(core: &Arc<Core>, for_dark: bool, lang: Lang) -> Option<TrayIcon> {
     let show_item = MenuItem::with_id("show", tr(lang, "显示主界面"), true, None);
     let inc_item = MenuItem::with_id("inc", tr(lang, "遮罩加深  +5%"), true, None);
     let dec_item = MenuItem::with_id("dec", tr(lang, "遮罩减淡  -5%"), true, None);
-    let reset_item = MenuItem::with_id("reset", tr(lang, "关闭遮罩（0%）"), true, None);
+    let reset_item = MenuItem::with_id("reset", crate::i18n::ui(lang, "关闭 / 开启遮罩"), true, None);
     let auto_item = CheckMenuItem::with_id("autostart", tr(lang, "开机自启"), true, false, None);
     let quit_item = MenuItem::with_id("quit", format!("{} {}", tr(lang, "退出程序"), crate::i18n::app_name(lang)), true, None);
     let sep1 = PredefinedMenuItem::separator();
@@ -94,7 +94,7 @@ pub fn init(core: &Arc<Core>, for_dark: bool, lang: Lang) -> Option<TrayIcon> {
             "show" => core_for_menu.show_window(),
             "inc" => core_for_menu.nudge_step(1.0),
             "dec" => core_for_menu.nudge_step(-1.0),
-            "reset" => core_for_menu.set_level(None, 0.0),
+            "reset" => core_for_menu.toggle_hide(),
             "autostart" => {
                 TRAY_ORIGIN.store(true, Ordering::SeqCst);
                 core_for_menu.toggle_autostart();
