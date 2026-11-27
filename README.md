@@ -6,7 +6,7 @@
 
 ## 下载与使用
 
-1. 到 [Releases](../../releases) 下载 `night_viewing_vX.X.X.zip`
+1. 到 [Releases](../../releases) 下载 `night_viewing_版本号.zip`
 2. 放到任意目录双击`NightViewing.exe`运行（无需安装、无需管理员权限）
 3. 首次启动只在托盘出现一个软件图标 —— 双击托盘图标或者右键托盘图标方式打开界面
 
